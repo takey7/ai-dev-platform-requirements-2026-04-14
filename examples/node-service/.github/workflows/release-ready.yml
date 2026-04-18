@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   release-ready:
-    uses: slm100/ai-dev-platform-requirements-2026-04-14/.github/workflows/release-ready.yml@main
+    uses: takey7/ai-dev-platform-requirements-2026-04-14/.github/workflows/release-ready.yml@main
     with:
       manifest_path: .platform/platform.yaml
     secrets: inherit

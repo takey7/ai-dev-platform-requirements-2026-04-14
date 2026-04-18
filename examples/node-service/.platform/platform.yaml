@@ -49,7 +49,7 @@
       "confluence_space": "PLATFORM"
     },
     "github": {
-      "source_repo": "slm100/ai-dev-platform-requirements-2026-04-14",
+      "source_repo": "takey7/ai-dev-platform-requirements-2026-04-14",
       "workflow_ref": "main",
       "template_repository": true
     }

@@ -15,7 +15,7 @@ cd ai-dev-platform-requirements-2026-04-14
   --adapter node-ts \
   --issue-project-key PROJ \
   --confluence-space SPACE \
-  --source-repo slm100/ai-dev-platform-requirements-2026-04-14 \
+  --source-repo takey7/ai-dev-platform-requirements-2026-04-14 \
   --version v0.1.0
 ```
 
