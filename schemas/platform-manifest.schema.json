@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/platform-manifest.schema.json",
+  "title": "Platform Manifest",
+  "type": "object",
+  "required": [
+    "platform",
+    "issue",
+    "paths",
+    "commands",
+    "risk",
+    "checks",
+    "deploy",
+    "integrations"
+  ],
+  "properties": {
+    "platform": {
+      "type": "object",
+      "required": [
+        "version",
+        "adapter"
+      ],
+      "properties": {
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "adapter": {
+          "type": "string",
+          "enum": [
+            "node-ts"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "issue": {
+      "type": "object",
+      "required": [
+        "project_key"
+      ],
+      "properties": {
+        "project_key": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9]+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "paths": {
+      "type": "object",
+      "required": [
+        "spec_dir",
+        "spec_template"
+      ],
+      "properties": {
+        "spec_dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "spec_template": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "commands": {
+      "type": "object",
+      "required": [
+        "install",
+        "lint",
+        "typecheck",
+        "test_unit",
+        "test_integration",
+        "build"
+      ],
+      "properties": {
+        "install": {
+          "type": "string"
+        },
+        "lint": {
+          "type": "string"
+        },
+        "typecheck": {
+          "type": "string"
+        },
+        "test_unit": {
+          "type": "string"
+        },
+        "test_integration": {
+          "type": "string"
+        },
+        "build": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "risk": {
+      "type": "object",
+      "required": [
+        "protected_paths"
+      ],
+      "properties": {
+        "protected_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "checks": {
+      "type": "object",
+      "required": [
+        "enabled"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "deploy": {
+      "type": "object",
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "none",
+            "staging-only",
+            "staging-prod"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "integrations": {
+      "type": "object",
+      "required": [
+        "atlassian",
+        "github"
+      ],
+      "properties": {
+        "atlassian": {
+          "type": "object",
+          "required": [
+            "mcp_url",
+            "auth_mode",
+            "project_scoped",
+            "api_token_opt_in",
+            "confluence_space"
+          ],
+          "properties": {
+            "mcp_url": {
+              "type": "string"
+            },
+            "auth_mode": {
+              "type": "string",
+              "enum": [
+                "oauth2.1"
+              ]
+            },
+            "project_scoped": {
+              "type": "boolean"
+            },
+            "api_token_opt_in": {
+              "type": "boolean"
+            },
+            "confluence_space": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "github": {
+          "type": "object",
+          "required": [
+            "source_repo",
+            "workflow_ref",
+            "template_repository"
+          ],
+          "properties": {
+            "source_repo": {
+              "type": "string",
+              "minLength": 1
+            },
+            "workflow_ref": {
+              "type": "string",
+              "minLength": 1
+            },
+            "template_repository": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

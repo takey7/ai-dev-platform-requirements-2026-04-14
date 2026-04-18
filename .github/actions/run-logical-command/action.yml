@@ -1,0 +1,46 @@
+name: Run Logical Command
+description: Read a logical command from the platform manifest and execute it.
+
+inputs:
+  manifest-path:
+    description: Path to .platform/platform.yaml
+    required: true
+  command-name:
+    description: Logical command key to execute
+    required: true
+  working-directory:
+    description: Working directory for the command
+    required: false
+    default: .
+
+runs:
+  using: composite
+  steps:
+    - name: Read logical command
+      id: command
+      shell: bash
+      run: |
+        python3 "${GITHUB_ACTION_PATH}/../../../ops/platform/checks.py" \
+          command-info \
+          --manifest "${{ inputs.manifest-path }}" \
+          --name "${{ inputs.command-name }}" \
+          --github-output "$GITHUB_OUTPUT"
+
+    - name: Set up Node
+      if: steps.command.outputs.adapter == 'node-ts'
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ steps.command.outputs.node_version }}
+
+    - name: Enable corepack
+      if: steps.command.outputs.adapter == 'node-ts'
+      shell: bash
+      run: |
+        corepack enable
+        corepack prepare pnpm@9.15.4 --activate
+
+    - name: Run logical command
+      if: steps.command.outputs.skip != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: ${{ steps.command.outputs.command }}

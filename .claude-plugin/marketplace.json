@@ -1,0 +1,30 @@
+{
+  "name": "ai-platform-tools",
+  "owner": {
+    "name": "Platform Team"
+  },
+  "metadata": {
+    "description": "Bootstrap and operate repositories that use the shared AI development flow.",
+    "version": "0.1.0",
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "claude-platform-bootstrap",
+      "source": "./plugins/claude-platform-bootstrap",
+      "description": "Use the shared platform CLI from Claude Code.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Platform Team"
+      },
+      "category": "productivity",
+      "tags": [
+        "bootstrap",
+        "platform",
+        "workflow",
+        "jira",
+        "github"
+      ]
+    }
+  ]
+}

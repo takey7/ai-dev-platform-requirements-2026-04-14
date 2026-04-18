@@ -1,0 +1,57 @@
+{
+  "platform": {
+    "version": "0.1.0",
+    "adapter": "node-ts"
+  },
+  "issue": {
+    "project_key": "DEMO"
+  },
+  "paths": {
+    "spec_dir": "docs/specs",
+    "spec_template": "docs/specs/ISSUE_SPEC_TEMPLATE.md"
+  },
+  "commands": {
+    "install": "pnpm install",
+    "lint": "pnpm lint",
+    "typecheck": "pnpm typecheck",
+    "test_unit": "pnpm test:unit",
+    "test_integration": "pnpm test:integration",
+    "build": "pnpm build"
+  },
+  "risk": {
+    "protected_paths": [
+      "packages/contracts/**",
+      "db/migrations/**",
+      "infra/prod/**",
+      "auth/**",
+      "api/public/**"
+    ]
+  },
+  "checks": {
+    "enabled": [
+      "ci",
+      "spec-gate",
+      "risk-classification",
+      "security-scan",
+      "ai-gate",
+      "release-ready"
+    ]
+  },
+  "deploy": {
+    "mode": "staging-prod"
+  },
+  "integrations": {
+    "atlassian": {
+      "mcp_url": "https://mcp.atlassian.com/v1/mcp",
+      "auth_mode": "oauth2.1",
+      "project_scoped": true,
+      "api_token_opt_in": false,
+      "confluence_space": "PLATFORM"
+    },
+    "github": {
+      "source_repo": "slm100/ai-dev-platform-requirements-2026-04-14",
+      "workflow_ref": "main",
+      "template_repository": true
+    }
+  }
+}

@@ -1,0 +1,38 @@
+name: Risk Classification
+description: Classify changed files into low, medium, or high risk labels.
+
+inputs:
+  manifest-path:
+    description: Path to .platform/platform.yaml
+    required: true
+  base-ref:
+    description: Base branch used for git diff
+    required: false
+    default: main
+
+outputs:
+  risk_level:
+    description: low, medium, or high
+    value: ${{ steps.risk.outputs.risk_level }}
+  labels:
+    description: JSON array of labels to add to the PR
+    value: ${{ steps.risk.outputs.labels }}
+  breaking_change:
+    description: Whether the spec marks the change as breaking
+    value: ${{ steps.risk.outputs.breaking_change }}
+  changed_files:
+    description: JSON array of changed files
+    value: ${{ steps.risk.outputs.changed_files }}
+
+runs:
+  using: composite
+  steps:
+    - name: Classify risk
+      id: risk
+      shell: bash
+      run: |
+        python3 "${GITHUB_ACTION_PATH}/../../../ops/platform/checks.py" \
+          risk-classify \
+          --manifest "${{ inputs.manifest-path }}" \
+          --base-ref "${{ inputs.base-ref }}" \
+          --github-output "$GITHUB_OUTPUT"

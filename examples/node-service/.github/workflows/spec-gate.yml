@@ -1,0 +1,15 @@
+name: spec-gate
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  spec-gate:
+    uses: slm100/ai-dev-platform-requirements-2026-04-14/.github/workflows/spec-gate.yml@main
+    with:
+      manifest_path: .platform/platform.yaml
+    secrets: inherit

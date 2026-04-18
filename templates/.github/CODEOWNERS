@@ -1,0 +1,10 @@
+# CODEOWNERS
+# 注意:
+# - 機械承認モデルでは CODEOWNERS を通常系の必須レビュー条件にしない
+# - 通知用、または manual lane / emergency lane 用に使うこと
+
+/packages/contracts/   @platform-team
+/db/migrations/        @platform-team
+/infra/prod/           @platform-team
+/auth/                 @security-team
+/api/public/           @api-team

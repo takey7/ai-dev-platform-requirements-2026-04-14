@@ -1,0 +1,15 @@
+name: release-ready
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  release-ready:
+    uses: {{SOURCE_REPO}}/.github/workflows/release-ready.yml@{{SOURCE_REF}}
+    with:
+      manifest_path: .platform/platform.yaml
+    secrets: inherit

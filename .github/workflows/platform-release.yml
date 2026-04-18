@@ -1,0 +1,46 @@
+name: platform-release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: package-platform
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build release bundle
+        run: |
+          mkdir -p dist
+          tar -czf "dist/platform-source-${GITHUB_REF_NAME}.tar.gz" \
+            .gitignore \
+            README.md \
+            docs \
+            references \
+            scaffolds \
+            schemas \
+            scripts \
+            bin \
+            ops \
+            plugins \
+            examples \
+            .github \
+            .claude-plugin
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ASSET="dist/platform-source-${GITHUB_REF_NAME}.tar.gz"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${ASSET}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "${ASSET}" --generate-notes --latest
+          fi

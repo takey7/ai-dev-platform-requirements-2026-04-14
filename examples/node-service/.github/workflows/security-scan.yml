@@ -1,0 +1,16 @@
+name: security-scan
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  security-scan:
+    uses: slm100/ai-dev-platform-requirements-2026-04-14/.github/workflows/security-scan.yml@main
+    with:
+      manifest_path: .platform/platform.yaml
+      base_ref: ${{ github.base_ref || github.event.merge_group.base_ref || github.event.repository.default_branch }}
+    secrets: inherit

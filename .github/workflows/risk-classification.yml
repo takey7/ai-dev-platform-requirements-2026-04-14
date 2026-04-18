@@ -1,0 +1,89 @@
+name: risk-classification
+
+on:
+  workflow_call:
+    inputs:
+      manifest_path:
+        required: false
+        type: string
+        default: .platform/platform.yaml
+      base_ref:
+        required: false
+        type: string
+        default: main
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  classify:
+    name: risk-classification
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/risk-classification
+        id: risk
+        with:
+          manifest-path: ${{ inputs.manifest_path }}
+          base-ref: ${{ inputs.base_ref }}
+
+      - name: Publish summary
+        shell: bash
+        run: |
+          {
+            echo "### Risk classification"
+            echo ""
+            echo "- risk level: ${{ steps.risk.outputs.risk_level }}"
+            echo "- breaking change: ${{ steps.risk.outputs.breaking_change }}"
+            echo "- labels: ${{ steps.risk.outputs.labels }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply labels to pull requests
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          LABELS_JSON: ${{ steps.risk.outputs.labels }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const labels = JSON.parse(process.env.LABELS_JSON || "[]");
+            if (!labels.length) return;
+            const colors = {
+              "risk:low": "0e8a16",
+              "risk:medium": "fbca04",
+              "risk:high": "d93f0b",
+              "breaking-change": "5319e7",
+              "db-migration": "0052cc",
+              "infra-prod": "b60205",
+              "security-sensitive": "b60205",
+              "rollback-ready": "1d76db",
+              "needs-canary": "5319e7"
+            };
+            for (const name of labels) {
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name
+                });
+              } catch {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name,
+                  color: colors[name] || "ededed"
+                });
+              }
+            }
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              labels
+            });

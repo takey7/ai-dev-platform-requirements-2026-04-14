@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: ci
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else echo "replace with your install command"; fi
+
+      - name: Lint
+        run: |
+          if npm run | grep -q " lint"; then npm run lint; else echo "replace with your lint command"; fi
+
+      - name: Typecheck
+        run: |
+          if npm run | grep -q " typecheck"; then npm run typecheck; else echo "replace with your typecheck command"; fi
+
+      - name: Test
+        run: |
+          if npm run | grep -q " test"; then npm test -- --runInBand || npm test; else echo "replace with your test command"; fi

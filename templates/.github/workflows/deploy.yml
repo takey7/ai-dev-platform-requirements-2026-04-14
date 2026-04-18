@@ -1,0 +1,40 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "staging or production"
+        required: true
+      version:
+        description: "Release version or tag"
+        required: true
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve release artifact
+        run: |
+          echo "Replace with artifact fetch or deployment bundle lookup"
+          echo "Deploying version=${{ inputs.version }} to env=${{ inputs.environment }}"
+
+      - name: Policy gate
+        run: |
+          echo "Replace with machine approval checks:"
+          echo "- rollout strategy"
+          echo "- rollback artifact exists"
+          echo "- SLO / canary / smoke checks"
+
+      - name: Deploy
+        run: |
+          echo "Replace with actual deploy command"
+          echo "deployment completed"

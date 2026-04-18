@@ -1,0 +1,31 @@
+name: security-scan
+
+on:
+  workflow_call:
+    inputs:
+      manifest_path:
+        required: false
+        type: string
+        default: .platform/platform.yaml
+      base_ref:
+        required: false
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/security-scan
+        with:
+          manifest-path: ${{ inputs.manifest_path }}
+          base-ref: ${{ inputs.base_ref }}

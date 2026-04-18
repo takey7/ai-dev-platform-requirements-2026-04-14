@@ -1,0 +1,27 @@
+name: Release Ready
+description: Validate rollout and rollback fields before release or deploy.
+
+inputs:
+  manifest-path:
+    description: Path to .platform/platform.yaml
+    required: true
+
+outputs:
+  passed:
+    description: Whether the release-ready gate passed
+    value: ${{ steps.ready.outputs.passed }}
+  errors:
+    description: JSON array of validation errors
+    value: ${{ steps.ready.outputs.errors }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate release readiness
+      id: ready
+      shell: bash
+      run: |
+        python3 "${GITHUB_ACTION_PATH}/../../../ops/platform/checks.py" \
+          release-ready \
+          --manifest "${{ inputs.manifest-path }}" \
+          --github-output "$GITHUB_OUTPUT"

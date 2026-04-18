@@ -1,0 +1,32 @@
+name: Security Scan
+description: Run a lightweight security scan across changed files.
+
+inputs:
+  manifest-path:
+    description: Path to .platform/platform.yaml
+    required: true
+  base-ref:
+    description: Base branch used for git diff
+    required: false
+    default: main
+
+outputs:
+  findings:
+    description: JSON array of findings
+    value: ${{ steps.scan.outputs.findings }}
+  passed:
+    description: Whether the scan passed
+    value: ${{ steps.scan.outputs.passed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Run security scan
+      id: scan
+      shell: bash
+      run: |
+        python3 "${GITHUB_ACTION_PATH}/../../../ops/platform/checks.py" \
+          security-scan \
+          --manifest "${{ inputs.manifest-path }}" \
+          --base-ref "${{ inputs.base-ref }}" \
+          --github-output "$GITHUB_OUTPUT"

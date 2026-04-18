@@ -1,0 +1,26 @@
+name: release-ready
+
+on:
+  workflow_call:
+    inputs:
+      manifest_path:
+        required: false
+        type: string
+        default: .platform/platform.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: release-ready
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/release-ready
+        with:
+          manifest-path: ${{ inputs.manifest_path }}

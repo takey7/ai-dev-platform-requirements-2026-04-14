@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  workflow_call:
+    inputs:
+      manifest_path:
+        required: false
+        type: string
+        default: .platform/platform.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: ci
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/run-logical-command
+        with:
+          manifest-path: ${{ inputs.manifest_path }}
+          command-name: install
+
+      - uses: ./.github/actions/run-logical-command
+        with:
+          manifest-path: ${{ inputs.manifest_path }}
+          command-name: lint
+
+      - uses: ./.github/actions/run-logical-command
+        with:
+          manifest-path: ${{ inputs.manifest_path }}
+          command-name: typecheck
+
+      - uses: ./.github/actions/run-logical-command
+        with:
+          manifest-path: ${{ inputs.manifest_path }}
+          command-name: test-unit
+
+      - uses: ./.github/actions/run-logical-command
+        with:
+          manifest-path: ${{ inputs.manifest_path }}
+          command-name: test-integration
+
+      - uses: ./.github/actions/run-logical-command
+        with:
+          manifest-path: ${{ inputs.manifest_path }}
+          command-name: build

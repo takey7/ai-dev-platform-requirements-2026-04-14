@@ -1,0 +1,10 @@
+# .codex/config.toml
+# 最小例。詳細は公式 docs を確認して調整すること。
+
+model = "gpt-5.4-mini"
+model_reasoning_effort = "high"
+
+# 追加設定例:
+# [projects."/workspace/repo"]
+# model = "gpt-5.4"
+# model_reasoning_effort = "medium"

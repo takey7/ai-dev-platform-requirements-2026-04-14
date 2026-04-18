@@ -1,0 +1,30 @@
+name: Spec Gate
+description: Validate that the relevant issue spec exists and includes required sections.
+
+inputs:
+  manifest-path:
+    description: Path to .platform/platform.yaml
+    required: true
+
+outputs:
+  issue_key:
+    description: Issue key inferred from the branch or available spec
+    value: ${{ steps.spec.outputs.issue_key }}
+  spec_path:
+    description: Spec file used for validation
+    value: ${{ steps.spec.outputs.spec_path }}
+  missing_sections:
+    description: JSON array of missing required sections
+    value: ${{ steps.spec.outputs.missing_sections }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate spec
+      id: spec
+      shell: bash
+      run: |
+        python3 "${GITHUB_ACTION_PATH}/../../../ops/platform/checks.py" \
+          spec-gate \
+          --manifest "${{ inputs.manifest-path }}" \
+          --github-output "$GITHUB_OUTPUT"
