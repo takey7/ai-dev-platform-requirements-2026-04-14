@@ -1,7 +1,8 @@
 {
   "platform": {
-    "version": "0.1.0",
-    "adapter": "node-ts"
+    "version": "0.1.5",
+    "adapter": "node-ts",
+    "service_name": "node-service"
   },
   "issue": {
     "project_key": "DEMO"
@@ -50,7 +51,7 @@
     },
     "github": {
       "source_repo": "takey7/ai-dev-platform-requirements-2026-04-14",
-      "workflow_ref": "main",
+      "workflow_ref": "v0.1.5",
       "template_repository": true
     }
   }

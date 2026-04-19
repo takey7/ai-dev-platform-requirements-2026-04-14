@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   ci:
-    uses: takey7/ai-dev-platform-requirements-2026-04-14/.github/workflows/ci.yml@main
+    uses: takey7/ai-dev-platform-requirements-2026-04-14/.github/workflows/ci.yml@v0.1.5
     with:
       manifest_path: .platform/platform.yaml
     secrets: inherit

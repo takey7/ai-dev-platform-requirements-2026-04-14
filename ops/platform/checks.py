@@ -110,6 +110,15 @@ def cmd_command_info(args: argparse.Namespace) -> int:
 
 def cmd_spec_gate(args: argparse.Namespace) -> int:
     manifest = load_manifest(Path(args.manifest))
+    expected_project_key = manifest_issue_project_key(manifest)
+    branch_issue_key = extract_branch_issue_key()
+    if branch_issue_key and not issue_key_matches_project(branch_issue_key, expected_project_key):
+        print(
+            f"Branch issue key `{branch_issue_key}` is out of scope for this repo. "
+            f"Expected Jira project `{expected_project_key}`.",
+            file=sys.stderr,
+        )
+        return 1
     spec_path, issue_key = locate_relevant_spec(manifest)
     if spec_path is None:
         print("No issue spec could be identified. Create one with `platform new-spec <ISSUE_KEY>`.", file=sys.stderr)
@@ -286,13 +295,10 @@ def locate_relevant_spec(manifest: dict[str, Any]) -> tuple[Path | None, str | N
     spec_dir = ROOT / manifest["paths"]["spec_dir"]
     if not spec_dir.exists():
         return None, None
+    expected_project_key = manifest_issue_project_key(manifest)
     branch_name = os.environ.get("GITHUB_HEAD_REF") or git_current_branch()
-    issue_key = None
-    if branch_name:
-        match = ISSUE_RE.search(branch_name)
-        if match:
-            issue_key = match.group(0)
-    if issue_key:
+    issue_key = extract_issue_key(branch_name) if branch_name else None
+    if issue_key and issue_key_matches_project(issue_key, expected_project_key):
         direct_path = spec_dir / f"{issue_key}.md"
         if direct_path.exists():
             return direct_path, issue_key
@@ -301,6 +307,7 @@ def locate_relevant_spec(manifest: dict[str, Any]) -> tuple[Path | None, str | N
             path
             for path in spec_dir.glob("*.md")
             if path.name != "ISSUE_SPEC_TEMPLATE.md"
+            and issue_key_matches_project(path.stem, expected_project_key)
         ]
     )
     if not candidates:
@@ -342,6 +349,24 @@ def git_current_branch() -> str | None:
         return None
     branch = result.stdout.strip()
     return None if branch == "HEAD" else branch
+
+
+def extract_branch_issue_key() -> str | None:
+    branch_name = os.environ.get("GITHUB_HEAD_REF") or git_current_branch()
+    return extract_issue_key(branch_name) if branch_name else None
+
+
+def extract_issue_key(value: str) -> str | None:
+    match = ISSUE_RE.search(value.upper())
+    return match.group(0) if match else None
+
+
+def manifest_issue_project_key(manifest: dict[str, Any]) -> str:
+    return str(manifest["issue"]["project_key"]).upper()
+
+
+def issue_key_matches_project(issue_key: str, project_key: str) -> bool:
+    return issue_key.upper().startswith(f"{project_key.upper()}-")
 
 
 def matches_any(path: str, patterns: list[str]) -> bool:

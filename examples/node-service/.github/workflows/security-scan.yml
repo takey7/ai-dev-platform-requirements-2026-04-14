@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   security-scan:
-    uses: takey7/ai-dev-platform-requirements-2026-04-14/.github/workflows/security-scan.yml@main
+    uses: takey7/ai-dev-platform-requirements-2026-04-14/.github/workflows/security-scan.yml@v0.1.5
     with:
       manifest_path: .platform/platform.yaml
       base_ref: ${{ github.base_ref || github.event.merge_group.base_ref || github.event.repository.default_branch }}

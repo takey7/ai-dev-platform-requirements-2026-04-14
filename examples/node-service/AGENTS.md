@@ -13,6 +13,13 @@
 - Confluence space: PLATFORM
 - Default issue prefix in branches: DEMO
 
+## Atlassian scope policy
+- Only access Jira work in project `DEMO`
+- Only access Confluence content in space `PLATFORM`
+- Do not search, list, or summarize across all Jira projects or all Confluence spaces
+- Start Jira searches with `project = DEMO`
+- Treat any other Jira project or Confluence space as out of scope unless the user explicitly names it and asks for cross-project work
+
 ## Required commands
 - Install: `pnpm install`
 - Lint: `pnpm lint`
@@ -20,6 +27,11 @@
 - Unit test: `pnpm test:unit`
 - Integration test: `pnpm test:integration`
 - Build: `pnpm build`
+
+## Authentication
+- Claude Code: use `claude auth login --claudeai`
+- Codex CLI: use `codex login`
+- Do not make `OPENAI_API_KEY` part of the default local workflow
 
 ## Review policy
 ### Always check

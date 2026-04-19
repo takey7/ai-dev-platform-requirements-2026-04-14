@@ -13,6 +13,13 @@
 - Confluence space: {{CONFLUENCE_SPACE}}
 - Default issue prefix in branches: {{ISSUE_PROJECT_KEY}}
 
+## Atlassian scope policy
+- Only access Jira work in project `{{ISSUE_PROJECT_KEY}}`
+- Only access Confluence content in space `{{CONFLUENCE_SPACE}}`
+- Do not search, list, or summarize across all Jira projects or all Confluence spaces
+- Start Jira searches with `project = {{ISSUE_PROJECT_KEY}}`
+- Treat any other Jira project or Confluence space as out of scope unless the user explicitly names it and asks for cross-project work
+
 ## Required commands
 - Install: `{{INSTALL_COMMAND}}`
 - Lint: `{{LINT_COMMAND}}`

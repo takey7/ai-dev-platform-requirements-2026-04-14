@@ -152,6 +152,14 @@ base 層は stack-neutral を維持し、Node 前提の実装は `scaffolds/adap
 - 標準 endpoint は `/v1/mcp`
 - 認証は OAuth 2.1 前提
 - API token は opt-in の補助用途のみ
+- 各 consuming repo は 1 つの Jira project key を `issue.project_key` に固定する
+- AI はその Jira project key と既定の Confluence space だけを扱い、他 project / space は明示的なユーザー指示がない限り対象外にする
+
+## Jira template recommendation
+- この標準開発フローの既定は `カンバン` が最適
+- 理由: repo 単位の継続 delivery と相性がよく、sprint ceremony を前提にしないため導入コストが低い
+- `スクラム` は、すでに固定長 sprint を運用しているチームだけに限定して選ぶ
+- `Jira Product Discovery` のテンプレートは delivery 管理ではなく discovery / prioritization 用なので、repo ごとの開発 space の既定にはしない
 
 ## 今回の source repo で追加した主な実装
 - `scripts/platform.py`

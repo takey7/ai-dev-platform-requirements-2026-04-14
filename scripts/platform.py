@@ -268,6 +268,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     spec_dir = target / manifest["paths"]["spec_dir"]
     if not spec_dir.exists():
         errors.append(f"Spec directory does not exist: {spec_dir.relative_to(target)}")
+    else:
+        expected_project_key = manifest_issue_project_key(manifest)
+        for spec_path in sorted(spec_dir.glob("*.md")):
+            if spec_path.name == "ISSUE_SPEC_TEMPLATE.md":
+                continue
+            if not issue_key_matches_project(spec_path.stem, expected_project_key):
+                errors.append(
+                    f"{spec_path.relative_to(target)} does not match Jira project key `{expected_project_key}`."
+                )
 
     report_issues(errors, warnings)
     return 1 if errors else 0
@@ -316,9 +325,21 @@ def cmd_new_spec(args: argparse.Namespace) -> int:
     issue_key = args.issue_key.upper()
     if not ISSUE_RE.fullmatch(issue_key):
         fail(f"Invalid issue key: {issue_key}")
+    expected_project_key = manifest_issue_project_key(manifest)
+    if not issue_key_matches_project(issue_key, expected_project_key):
+        fail(
+            f"Issue key `{issue_key}` is out of scope for this repo. "
+            f"Expected Jira project `{expected_project_key}`."
+        )
 
     slug = slugify(args.title)
     branch = args.branch or f"feat/{issue_key}-{slug}"
+    branch_issue_key = extract_issue_key(branch)
+    if branch_issue_key and branch_issue_key != issue_key:
+        fail(
+            f"Branch `{branch}` contains issue key `{branch_issue_key}` "
+            f"but the spec is for `{issue_key}`."
+        )
     destination = spec_dir / f"{issue_key}.md"
     if destination.exists() and not args.force:
         fail(f"{destination} already exists. Re-run with --force to overwrite.")
@@ -623,6 +644,19 @@ def make_executable(*paths: Path) -> None:
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return slug or "change"
+
+
+def manifest_issue_project_key(manifest: dict[str, Any]) -> str:
+    return str(manifest["issue"]["project_key"]).upper()
+
+
+def issue_key_matches_project(issue_key: str, project_key: str) -> bool:
+    return issue_key.upper().startswith(f"{project_key.upper()}-")
+
+
+def extract_issue_key(value: str) -> str | None:
+    match = ISSUE_RE.search(value.upper())
+    return match.group(0) if match else None
 
 
 def validate_manifest_shape(manifest: dict[str, Any]) -> list[str]:
