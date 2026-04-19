@@ -283,7 +283,7 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
     source_repo = args.source_repo or manifest["integrations"]["github"]["source_repo"]
     issue_project_key = manifest["issue"]["project_key"]
     confluence_space = manifest["integrations"]["atlassian"]["confluence_space"]
-    service_name = target.name
+    service_name = manifest["platform"].get("service_name", target.name)
     context = build_context(
         service_name=service_name,
         adapter=manifest["platform"]["adapter"],
@@ -408,6 +408,7 @@ def build_manifest(
         "platform": {
             "version": context["RELEASE_TAG"],
             "adapter": context["ADAPTER"],
+            "service_name": context["SERVICE_NAME"],
         },
         "issue": {
             "project_key": context["ISSUE_PROJECT_KEY"],
@@ -449,6 +450,12 @@ def build_manifest(
         },
     }
     if existing_manifest:
+        manifest["platform"] = {
+            **manifest["platform"],
+            **existing_manifest.get("platform", {}),
+            "version": context["RELEASE_TAG"],
+            "adapter": context["ADAPTER"],
+        }
         manifest["commands"] = existing_manifest.get("commands", manifest["commands"])
         manifest["risk"] = existing_manifest.get("risk", manifest["risk"])
         manifest["checks"] = existing_manifest.get("checks", manifest["checks"])
