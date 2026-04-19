@@ -41,6 +41,16 @@ cd ai-dev-platform-requirements-2026-04-14
 chmod +x bin/platform scripts/platform.py ops/platform/checks.py
 ```
 
+### 1.5. Claude / Codex をログイン方式で使う
+```bash
+claude auth login --claudeai
+codex login
+```
+
+- Claude Code は `claude.ai` ログインを前提にする
+- Codex CLI は ChatGPT ログインを前提にする
+- `OPENAI_API_KEY` の手動設定は標準経路にしない
+
 ### 2. 空 repo に標準基盤を導入する
 ```bash
 ./bin/platform bootstrap \
@@ -68,13 +78,15 @@ chmod +x bin/platform scripts/platform.py ops/platform/checks.py
 ```bash
 ./bin/platform upgrade \
   --target /path/to/repo \
-  --to v0.1.0
+  --to v0.1.1
 ```
 
 ## Recommended tool versions
 - Claude Code:
   `2.1.109` or newer is recommended as of April 15, 2026.
   Recent updates added plugin marketplace improvements and shipped a fix for a workspace-trust-related hook execution security issue in `2.1.108`.
+- Codex:
+  use the current CLI and sign in with ChatGPT. If you previously used API-key auth, run `codex logout` and then `codex login`.
 - GitHub CLI:
   keep `gh` current so release and repository API support stays aligned with GitHub Cloud.
 - Check your local versions with:
@@ -99,6 +111,8 @@ codex --version
   - `security-scan`
   - `ai-gate`
   - `release-ready`
+- `ai-gate` は `OPENAI_API_KEY` を使う GitHub Action ではなく、ChatGPT/GitHub 連携済みの Codex review を使う運用ガイド check として動かす
+- Codex review は GitHub 側で automatic reviews を有効化するか、PR 上で `@codex` を使って呼ぶ
 - source repo を private にする場合は、GitHub Actions の repository settings で
   `Accessible from repositories owned by '<OWNER>'`
   を有効にしないと、他 repo から reusable workflows と actions を参照できない

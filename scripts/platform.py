@@ -235,6 +235,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if shutil.which(tool) is None:
             errors.append(f"Required tool not found on PATH: {tool}")
 
+    warnings.extend(check_local_auth(adapter))
+
     for check_name in REQUIRED_CHECKS:
         workflow_path = target / ".github" / "workflows" / f"{check_name}.yml"
         if not workflow_path.exists():
@@ -481,6 +483,43 @@ def load_manifest(path: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         fail(f"Manifest must be JSON-compatible YAML: {path} ({exc})")
     raise AssertionError("unreachable")
+
+
+def check_local_auth(adapter: str) -> list[str]:
+    warnings: list[str] = []
+
+    claude_status = run_optional(["claude", "auth", "status"])
+    if claude_status and claude_status.returncode == 0:
+        try:
+            payload = json.loads(claude_status.stdout)
+        except json.JSONDecodeError:
+            payload = {}
+        if not payload.get("loggedIn", False):
+            warnings.append("Claude is installed but not logged in. Run `claude auth login --claudeai`.")
+    else:
+        warnings.append("Claude auth status could not be verified. Run `claude auth status`.")
+
+    codex_status = run_optional(["codex", "login", "status"])
+    if codex_status and codex_status.returncode == 0:
+        codex_output = f"{codex_status.stdout}\n{codex_status.stderr}".lower()
+        if "logged in" not in codex_output or "chatgpt" not in codex_output:
+            warnings.append("Codex is not using ChatGPT login. Run `codex logout` then `codex login`.")
+    else:
+        warnings.append("Codex login status could not be verified. Run `codex login status`.")
+
+    if adapter == "node-ts" and os.environ.get("OPENAI_API_KEY"):
+        warnings.append(
+            "OPENAI_API_KEY is set in the local shell. This baseline expects login-based Codex usage, not manual API keys."
+        )
+
+    return warnings
+
+
+def run_optional(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, check=False)
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
 
 
 def copy_tree(

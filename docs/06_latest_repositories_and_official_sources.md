@@ -10,7 +10,6 @@
 | Claude plugins | Claude Code Plugins reference | plugin / skill / agent / hook を project scope で配布できる | `.claude/settings.json` で共有 |
 | Claude hooks | Claude Code Hooks guide | 危険コマンド抑止・format・review gate の決定的制御 | LLM 任せにしない |
 | Codex local bridge | `openai/codex-plugin-cc` | Claude から Codex review / rescue を呼ぶ最短経路 | `/codex:review` 等 |
-| Codex CI bridge | `openai/codex-action` | GitHub required check として AI gate を作りやすい | sandbox / safety-strategy がある |
 | Codex GitHub integration | OpenAI Developers: Codex in GitHub | PR review / automatic reviews の公式経路 | GitHub review は P0/P1 中心 |
 | Codex Cloud env | OpenAI Developers: Cloud environments | 長時間タスク・setup/maintenance・secrets・cache の設計指針 | secrets は setup のみ |
 | GitHub rulesets | GitHub Docs | branch protection より組織横断で扱いやすい | layering あり |
@@ -23,7 +22,7 @@
 - Atlassian Rovo MCP
 - Claude plugin/hooks
 - `codex-plugin-cc`
-- `codex-action`
+- Codex GitHub integration
 - GitHub rulesets / merge queue / Actions / environments / attestations
 - Codex Cloud（長時間処理・バックグラウンド用）
 
@@ -46,7 +45,6 @@
 - Claude plugin は project scope で配布できる
 - hooks は deterministic control として使える
 - `codex-plugin-cc` は review / adversarial review / rescue / status / result / cancel を提供
-- `codex-action` は secure proxy + sandbox + safety strategy を持つ
 - GitHub rulesets は layered で最も厳しいルールが効く
 - merge queue は busy branch を壊しにくい
 - GitHub review 上の Codex は P0/P1 中心
@@ -64,7 +62,7 @@
 実装着手の直前に以下だけ再確認すること。
 
 1. `codex-plugin-cc` README
-2. `openai/codex-action` README
+2. Codex in GitHub docs
 3. Claude Code plugin / hooks docs
 4. GitHub rulesets / merge queue / environments docs
 5. Atlassian Rovo MCP getting started / control settings / monitoring docs

@@ -39,7 +39,7 @@
 ### 実施項目
 - rulesets / merge queue
 - CI / spec gate / risk gate / security gate
-- `codex-action` による AI gate
+- ChatGPT/GitHub 連携の Codex review と login-based AI gate
 - auto-merge
 
 ### Exit criteria

@@ -21,6 +21,11 @@
 - Integration test: `{{INTEGRATION_TEST_COMMAND}}`
 - Build: `{{BUILD_COMMAND}}`
 
+## Authentication
+- Claude Code: use `claude auth login --claudeai`
+- Codex CLI: use `codex login`
+- Do not make `OPENAI_API_KEY` part of the default local workflow
+
 ## Review policy
 ### Always check
 - correctness
