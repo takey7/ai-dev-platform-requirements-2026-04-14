@@ -535,6 +535,8 @@ def copy_tree(
     for file_path in sorted(source.rglob("*")):
         if file_path.is_dir():
             continue
+        if "__pycache__" in file_path.parts or file_path.suffix == ".pyc":
+            continue
         relative_path = file_path.relative_to(source)
         copy_file(file_path, destination / relative_path, context, overwrite=overwrite)
 
