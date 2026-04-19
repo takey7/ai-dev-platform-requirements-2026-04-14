@@ -150,8 +150,8 @@ def cmd_risk_classify(args: argparse.Namespace) -> int:
     spec_path, _ = locate_relevant_spec(manifest)
     breaking_change = False
     if spec_path and spec_path.exists():
-        spec_text = spec_path.read_text(encoding="utf-8").lower()
-        breaking_change = "breaking change: `yes" in spec_text or "breaking change: yes" in spec_text
+        spec_text = spec_path.read_text(encoding="utf-8")
+        breaking_change = spec_marks_breaking_change(spec_text)
         if breaking_change and "breaking-change" not in labels:
             labels.append("breaking-change")
     if high_risk:
@@ -364,6 +364,18 @@ def high_risk_labels(paths: list[str]) -> list[str]:
         labels.append("breaking-change")
     labels.extend(["rollback-ready", "needs-canary"])
     return labels
+
+
+def spec_marks_breaking_change(spec_text: str) -> bool:
+    match = re.search(r"^- Breaking change:\s*(.+)$", spec_text, flags=re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return False
+    raw_value = match.group(1).strip().strip("`").strip().lower()
+    if raw_value in {"yes", "true"}:
+        return True
+    if raw_value in {"no", "false", "yes / no", "yes/no", "yes or no"}:
+        return False
+    return raw_value.startswith("yes ") or raw_value == "yes."
 
 
 def write_outputs(values: dict[str, str], github_output: str | None) -> None:

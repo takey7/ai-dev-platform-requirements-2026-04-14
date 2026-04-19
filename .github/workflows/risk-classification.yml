@@ -53,7 +53,17 @@ jobs:
           github-token: ${{ github.token }}
           script: |
             const labels = JSON.parse(process.env.LABELS_JSON || "[]");
-            if (!labels.length) return;
+            const managedLabels = [
+              "risk:low",
+              "risk:medium",
+              "risk:high",
+              "breaking-change",
+              "db-migration",
+              "infra-prod",
+              "security-sensitive",
+              "rollback-ready",
+              "needs-canary"
+            ];
             const colors = {
               "risk:low": "0e8a16",
               "risk:medium": "fbca04",
@@ -81,9 +91,31 @@ jobs:
                 });
               }
             }
-            await github.rest.issues.addLabels({
+            const issue_number = context.payload.pull_request.number;
+            const existing = await github.paginate(github.rest.issues.listLabelsOnIssue, {
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              labels
+              issue_number,
+              per_page: 100
             });
+            const existingManaged = existing
+              .map((label) => label.name)
+              .filter((name) => managedLabels.includes(name));
+            for (const name of existingManaged) {
+              if (!labels.includes(name)) {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number,
+                  name
+                }).catch(() => {});
+              }
+            }
+            if (labels.length) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                labels
+              });
+            }
