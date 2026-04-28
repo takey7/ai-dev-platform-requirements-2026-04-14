@@ -175,11 +175,17 @@ Jira 側でも次の comment commands を使えます。
   - `/ai drain-project`
 
 ## Recommended tool versions
+- OpenAI / Codex:
+  - resident orchestrator の Codex stages は既定で `~/.codex/config.toml` を読まない
+  - `codex_model=""` は Codex CLI の組み込み current default に委ねる
+  - Codex CLI と ChatGPT/Codex 側の default が更新されれば、そのまま最新版へ追従する
+  - GPT-5.5 は coding / tool-heavy agents / long-running workflows 向けの現在の明示 pin 候補として扱う
+  - Codex CLI は ChatGPT login を使う。API key を標準経路にしない
 - Claude Code:
-  `2.1.109` or newer is recommended as of April 15, 2026.
-  Recent updates added plugin marketplace improvements and shipped a fix for a workspace-trust-related hook execution security issue in `2.1.108`.
-- Codex:
-  use the current CLI and sign in with ChatGPT. If you previously used API-key auth, run `codex logout` and then `codex login`.
+  - `2.1.121` or newer is recommended as of April 29, 2026
+  - use Claude model aliases instead of pinned dated model names
+  - default worker setting is `claude_model=default`; use `best`, `opus`, or `sonnet` when a project needs an explicit latest-model policy
+  - run `claude update` or install `claude-code@latest` if you need the latest release channel
 - GitHub CLI:
   keep `gh` current so release and repository API support stays aligned with GitHub Cloud.
 - Check your local versions with:
@@ -187,6 +193,29 @@ Jira 側でも次の comment commands を使えます。
 claude --version
 gh --version
 codex --version
+```
+
+Worker model settings can be changed without editing repo manifests:
+```bash
+./bin/platform orchestrator configure \
+  --codex-model "" \
+  --codex-ignore-user-config \
+  --claude-model default \
+  --claude-effort ""
+```
+
+To pin Codex explicitly instead of tracking the CLI default:
+```bash
+./bin/platform orchestrator configure --codex-model gpt-5.5 --codex-ignore-user-config
+```
+
+Only use `--codex-use-user-config` when a dedicated worker intentionally wants to inherit that OS user's `~/.codex/config.toml`.
+
+For maximum Claude reasoning on a dedicated worker:
+```bash
+./bin/platform orchestrator configure \
+  --claude-model best \
+  --claude-effort xhigh
 ```
 
 ## GitHub での使い方
@@ -272,7 +301,7 @@ base 層は stack-neutral を維持し、Node 前提の実装は `scaffolds/adap
 
 ## 今回の source repo で追加した主な実装
 - `scripts/platform.py`
-  bootstrap / configure / create-project / doctor / upgrade / new-spec
+  bootstrap / configure / create-project / setup-repo / doctor / upgrade / new-spec
 - `ops/platform/checks.py`
   local hook と CI で共有する spec/risk/security/release-ready logic
 - `scaffolds/base/`
@@ -288,6 +317,8 @@ base 層は stack-neutral を維持し、Node 前提の実装は `scaffolds/adap
 
 ## 関連ドキュメント
 - [導入 quickstart](docs/onboarding/quickstart.md)
+- [コピペ用 新規開発マニュアル](docs/onboarding/copy-paste-new-development.md)
+- [別環境エンジニア向け 既存 repo 導入依頼文](docs/onboarding/engineer-existing-repo-handoff.md)
 - [初回プロジェクト walkthrough](docs/onboarding/first-project-walkthrough.md)
 - [GitHub / 配布方針](docs/onboarding/distribution.md)
 - [worker host](docs/onboarding/orchestrator-host.md)

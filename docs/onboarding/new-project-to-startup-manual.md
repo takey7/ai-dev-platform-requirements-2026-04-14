@@ -92,6 +92,30 @@ cat ~/.config/ai-dev-platform/orchestrator.json
 - `projects_roots`
 - `jira_site_url`
 - `jira_admin_email`
+- `ai.codex_model`: 既定は空文字。Codex CLI の組み込み current default に追従する
+- `ai.codex_ignore_user_config`: 既定は `true`。worker は個人の `~/.codex/config.toml` を読まない
+- `ai.claude_model`: 既定 `default`
+- `ai.claude_effort`: 既定は空文字で Claude Code の既定に委ねる
+
+明示的に最新モデル方針を保存する場合:
+```bash
+./bin/platform orchestrator configure \
+  --codex-model "" \
+  --codex-ignore-user-config \
+  --claude-model default \
+  --claude-effort ""
+```
+
+Codex を固定したい専用 worker では `--codex-model gpt-5.5 --codex-ignore-user-config` を使います。
+
+専用 worker の OS ユーザー設定をあえて継承したい場合だけ `--codex-use-user-config` を使います。
+
+Claude 側を最も強い利用可能モデルに寄せる専用 worker では:
+```bash
+./bin/platform orchestrator configure \
+  --claude-model best \
+  --claude-effort xhigh
+```
 
 ## 5. consuming repo を worker に登録する
 ```bash

@@ -70,6 +70,11 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 project_root=[str(project_root)],
                 jira_site_url="ssbot.atlassian.net",
                 jira_admin_email="admin@example.com",
+                codex_model="gpt-5.5",
+                codex_use_user_config=False,
+                codex_ignore_user_config=True,
+                claude_model="best",
+                claude_effort="xhigh",
             )
 
             with contextlib.redirect_stdout(io.StringIO()):
@@ -80,6 +85,10 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertEqual(payload["public_base_url"], "https://orchestrator.example.com")
             self.assertIn(str(project_root.resolve()), payload["projects_roots"])
             self.assertEqual(payload["jira_site_url"], "https://ssbot.atlassian.net")
+            self.assertEqual(payload["ai"]["codex_model"], "gpt-5.5")
+            self.assertTrue(payload["ai"]["codex_ignore_user_config"])
+            self.assertEqual(payload["ai"]["claude_model"], "best")
+            self.assertEqual(payload["ai"]["claude_effort"], "xhigh")
 
     def test_default_event_mode_is_polling(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -87,6 +96,9 @@ class PlatformOrchestratorTests(unittest.TestCase):
             settings = orchestrator.load_worker_settings(config_override=str(config_path))
 
             self.assertEqual(settings.event_mode, "polling")
+            self.assertEqual(settings.codex_model, "")
+            self.assertTrue(settings.codex_ignore_user_config)
+            self.assertEqual(settings.claude_model, "default")
 
     def test_register_polling_mode_does_not_create_webhook_secret(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -698,6 +710,125 @@ class PlatformOrchestratorTests(unittest.TestCase):
             status_lines = self._git(repo, "status", "--short", "--untracked-files=all").stdout.splitlines()
             self.assertIn("A  README.md", status_lines)
             self.assertIn("?? .platform/.last-validation.json", status_lines)
+
+    def test_run_claude_json_applies_model_settings(self) -> None:
+        captured: dict[str, list[str]] = {}
+
+        def fake_run_tracked_command(_store, _issue_key, argv, **_kwargs):
+            captured["argv"] = argv
+            return SimpleNamespace(stdout=json.dumps({"structured_output": {"ok": True}}))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            schema_path = Path(tmpdir) / "schema.json"
+            schema_path.write_text('{"type":"object"}', encoding="utf-8")
+            original = orchestrator.run_tracked_command
+            try:
+                orchestrator.run_tracked_command = fake_run_tracked_command
+                result = orchestrator.run_claude_json(
+                    settings=SimpleNamespace(claude_model="best", claude_effort="xhigh"),
+                    store=SimpleNamespace(),
+                    issue_key="BILL-1",
+                    cwd=Path(tmpdir),
+                    prompt="return json",
+                    schema_path=schema_path,
+                )
+            finally:
+                orchestrator.run_tracked_command = original
+
+        self.assertEqual(result, {"ok": True})
+        self.assertIn("--model", captured["argv"])
+        self.assertIn("best", captured["argv"])
+        self.assertIn("--effort", captured["argv"])
+        self.assertIn("xhigh", captured["argv"])
+
+    def test_run_codex_exec_applies_model_setting(self) -> None:
+        captured: dict[str, list[str]] = {}
+
+        def fake_start_process(argv, *, cwd):
+            captured["argv"] = argv
+            return SimpleNamespace(pid=123, returncode=0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.enqueue_issue(
+                project_key="BILL",
+                repo_path=tmpdir,
+                issue_key="BILL-1",
+                status="To Do",
+                summary="model test",
+            )
+            original_start = orchestrator.start_process
+            original_communicate = orchestrator.communicate_or_terminate
+            original_changed = orchestrator.git_changed_files
+            original_summarize = orchestrator.summarize_codex_jsonl
+            try:
+                orchestrator.start_process = fake_start_process
+                orchestrator.communicate_or_terminate = lambda _process, *, timeout_seconds: ("", "", False)
+                orchestrator.git_changed_files = lambda _path: []
+                orchestrator.summarize_codex_jsonl = lambda _stdout: "ok"
+                result = orchestrator.run_codex_exec(
+                    store,
+                    SimpleNamespace(codex_model="gpt-5.5", codex_ignore_user_config=True),
+                    Path(tmpdir),
+                    "BILL",
+                    "BILL-1",
+                    "codex/BILL-1-test",
+                    {"goal": "test"},
+                )
+            finally:
+                orchestrator.start_process = original_start
+                orchestrator.communicate_or_terminate = original_communicate
+                orchestrator.git_changed_files = original_changed
+                orchestrator.summarize_codex_jsonl = original_summarize
+
+        self.assertEqual(result["status"], "success")
+        self.assertIn("--ignore-user-config", captured["argv"])
+        self.assertIn("--model", captured["argv"])
+        self.assertIn("gpt-5.5", captured["argv"])
+
+    def test_run_codex_review_applies_model_setting(self) -> None:
+        captured: dict[str, list[str]] = {}
+
+        def fake_start_process(argv, *, cwd):
+            captured["argv"] = argv
+            return SimpleNamespace(pid=123, returncode=0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.enqueue_issue(
+                project_key="BILL",
+                repo_path=tmpdir,
+                issue_key="BILL-1",
+                status="To Do",
+                summary="model test",
+            )
+            original_start = orchestrator.start_process
+            original_communicate = orchestrator.communicate_or_terminate
+            original_changed = orchestrator.git_changed_files
+            original_stage = orchestrator.stage_meaningful_changes
+            original_summarize = orchestrator.summarize_codex_jsonl
+            try:
+                orchestrator.start_process = fake_start_process
+                orchestrator.communicate_or_terminate = lambda _process, *, timeout_seconds: ("", "", False)
+                orchestrator.git_changed_files = lambda _path: []
+                orchestrator.stage_meaningful_changes = lambda _path: None
+                orchestrator.summarize_codex_jsonl = lambda _stdout: "ok"
+                result = orchestrator.run_codex_review(
+                    store,
+                    SimpleNamespace(codex_model="gpt-5.5", codex_ignore_user_config=True),
+                    "BILL-1",
+                    Path(tmpdir),
+                )
+            finally:
+                orchestrator.start_process = original_start
+                orchestrator.communicate_or_terminate = original_communicate
+                orchestrator.git_changed_files = original_changed
+                orchestrator.stage_meaningful_changes = original_stage
+                orchestrator.summarize_codex_jsonl = original_summarize
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(captured["argv"][:5], ["codex", "exec", "--ignore-user-config", "--model", "gpt-5.5"])
+        self.assertIn("review", captured["argv"])
 
     def _git(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

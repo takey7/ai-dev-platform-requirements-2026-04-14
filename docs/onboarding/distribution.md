@@ -73,7 +73,8 @@
 - validate the plugin manifest before publishing
 - add the marketplace with `claude plugin marketplace add <repo-or-url>`
 - install the plugin with project or user scope
-- recommend Claude Code `2.1.109` or newer to pick up the April 14-15, 2026 plugin and security fixes
+- recommend Claude Code `2.1.121` or newer
+- use Claude Code model aliases (`default`, `best`, `opus`, `sonnet`) instead of pinned dated model names
 
 ## Jira issue creation policy
 - use Claude + MCP as the standard runtime path

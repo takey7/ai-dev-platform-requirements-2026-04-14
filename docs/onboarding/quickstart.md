@@ -43,7 +43,28 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
 
 This creates a GitHub private repo, bootstraps the baseline, provisions a Jira Software Kanban project, and starts `claude` / `codex` in tmux.
 
-## 5. Bootstrap a consuming repo directly
+## 5. Existing repo: provision GitHub/Jira and bootstrap in one step
+
+Use this when an engineer is already inside the target repo and the repo needs the same environment.
+
+```bash
+./bin/platform setup-repo \
+  --target /path/to/target-repo \
+  --github-owner takey7 \
+  --repo-name billing-api \
+  --project-name "Billing API" \
+  --jira-key BILL \
+  --jira-name "Billing API" \
+  --confluence-space BILL \
+  --adapter node-ts \
+  --launch-mode none
+```
+
+This creates or attaches a GitHub private repo, creates a Jira Software Kanban project, bootstraps the baseline, commits/pushes the setup, and registers the repo with the polling orchestrator.
+
+For copy-paste instructions for another engineer, use [engineer-existing-repo-handoff.md](engineer-existing-repo-handoff.md).
+
+## 6. Bootstrap a consuming repo directly
 ```bash
 git clone <platform-source-repo>
 cd ai-dev-platform-requirements-2026-04-14
@@ -59,18 +80,28 @@ cd ai-dev-platform-requirements-2026-04-14
 
 `bootstrap` remains the canonical platform primitive. `create-project` is the greenfield convenience wrapper around the same baseline logic.
 
-## 6. Validate the result
+`bootstrap` only applies files. It does not create GitHub repos, Jira projects, setup commits, or orchestrator registrations.
+
+## 7. Validate the result
 ```bash
 ./bin/platform doctor --target /path/to/consumer-repo
 ```
 
-## 7. Register the resident orchestrator
+## 8. Register the resident orchestrator
 
 ```bash
 ./bin/platform orchestrator register --target /path/to/consumer-repo
+
+./bin/platform orchestrator configure \
+  --codex-model "" \
+  --codex-ignore-user-config \
+  --claude-model default \
+  --claude-effort ""
 ```
 
 This updates `~/.config/ai-dev-platform/orchestrator.json`, creates or reuses the Jira control issue, and registers the repo for polling-first orchestration.
+
+The worker ignores `~/.codex/config.toml` by default. Empty `--codex-model` means the Codex CLI built-in current default, not a personal model pin in the OS user's config.
 
 Webhook mode is optional. Only use it when you intentionally want Jira Automation callbacks:
 

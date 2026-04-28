@@ -44,6 +44,10 @@ DEFAULT_FALLBACK_REVIEW_GRACE_SECONDS = 300
 DEFAULT_CLAUDE_TIMEOUT_SECONDS = 300
 DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 120
 DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS = 60
+DEFAULT_CODEX_MODEL = ""
+DEFAULT_CODEX_IGNORE_USER_CONFIG = True
+DEFAULT_CLAUDE_MODEL = "default"
+DEFAULT_CLAUDE_EFFORT = ""
 ATLASSIAN_TOKEN_KEYCHAIN_SERVICE = "ai-dev-platform.atlassian-api-token"
 IGNORED_WORKTREE_PREFIXES = (".tmp/",)
 IGNORED_WORKTREE_PATHS = {
@@ -107,6 +111,10 @@ class WorkerSettings:
     codex_review_authors: tuple[str, ...]
     auto_review_grace_seconds: int
     fallback_review_grace_seconds: int
+    codex_model: str
+    codex_ignore_user_config: bool
+    claude_model: str
+    claude_effort: str
     jira_site_url: str
     jira_admin_email: str
 
@@ -172,6 +180,32 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     )
     configure.add_argument("--jira-site-url", default=None, help="Atlassian Cloud site URL.")
     configure.add_argument("--jira-admin-email", default=None, help="Jira admin email.")
+    configure.add_argument(
+        "--codex-model",
+        default=None,
+        help="Codex CLI model for worker coding/review stages. Use empty string to defer to Codex defaults.",
+    )
+    configure.add_argument(
+        "--codex-use-user-config",
+        action="store_true",
+        help="Allow worker Codex subprocesses to load ~/.codex/config.toml. Default is isolated.",
+    )
+    configure.add_argument(
+        "--codex-ignore-user-config",
+        action="store_true",
+        help="Force worker Codex subprocesses to ignore ~/.codex/config.toml.",
+    )
+    configure.add_argument(
+        "--claude-model",
+        default=None,
+        help="Claude Code model alias or full name for worker planning/integration stages.",
+    )
+    configure.add_argument(
+        "--claude-effort",
+        choices=["", "low", "medium", "high", "xhigh", "max"],
+        default=None,
+        help="Claude Code effort level for worker planning/integration. Empty string defers to Claude defaults.",
+    )
     configure.set_defaults(func=cmd_configure)
 
     run = orchestrator_subparsers.add_parser(
@@ -344,6 +378,25 @@ def cmd_configure(args: argparse.Namespace) -> int:
         config["jira_site_url"] = normalize_public_base_url(args.jira_site_url)
     if args.jira_admin_email is not None:
         config["jira_admin_email"] = args.jira_admin_email
+    if (
+        args.codex_model is not None
+        or args.codex_use_user_config
+        or args.codex_ignore_user_config
+        or args.claude_model is not None
+        or args.claude_effort is not None
+    ):
+        ai_config = dict(config.get("ai", {}))
+        if args.codex_model is not None:
+            ai_config["codex_model"] = args.codex_model.strip()
+        if args.codex_use_user_config:
+            ai_config["codex_ignore_user_config"] = False
+        if args.codex_ignore_user_config:
+            ai_config["codex_ignore_user_config"] = True
+        if args.claude_model is not None:
+            ai_config["claude_model"] = args.claude_model.strip()
+        if args.claude_effort is not None:
+            ai_config["claude_effort"] = args.claude_effort.strip()
+        config["ai"] = ai_config
     save_orchestrator_config(config, config_path)
     print(f"Saved orchestrator config: {config_path}")
     print(json.dumps(config, indent=2, ensure_ascii=False))
@@ -1698,6 +1751,14 @@ def load_worker_settings(
     save_orchestrator_config(config, config_path)
 
     state_dir = default_state_dir()
+    configured_codex_review_authors = tuple(
+        str(item).strip().lower()
+        for item in config.get("github", {}).get("codex_review_authors", DEFAULT_CODEX_REVIEW_AUTHORS)
+        if str(item).strip()
+    )
+    codex_review_authors = tuple(
+        dict.fromkeys([*configured_codex_review_authors, *DEFAULT_CODEX_REVIEW_AUTHORS])
+    )
     return WorkerSettings(
         config_path=config_path,
         db_path=state_dir / DB_FILENAME,
@@ -1708,12 +1769,7 @@ def load_worker_settings(
         projects_roots=tuple(Path(item).expanduser().resolve() for item in config["projects_roots"]),
         poll_intervals={key: int(value) for key, value in config["poll_intervals"].items()},
         github_mode=str(config["github_mode"]),
-        codex_review_authors=tuple(
-            str(item).strip().lower()
-            for item in config.get("github", {}).get("codex_review_authors", DEFAULT_CODEX_REVIEW_AUTHORS)
-            if str(item).strip()
-        )
-        or DEFAULT_CODEX_REVIEW_AUTHORS,
+        codex_review_authors=codex_review_authors or DEFAULT_CODEX_REVIEW_AUTHORS,
         auto_review_grace_seconds=int(
             config.get("github", {}).get("auto_review_grace_seconds", DEFAULT_AUTO_REVIEW_GRACE_SECONDS)
         ),
@@ -1723,6 +1779,12 @@ def load_worker_settings(
                 DEFAULT_FALLBACK_REVIEW_GRACE_SECONDS,
             )
         ),
+        codex_model=str(config.get("ai", {}).get("codex_model", DEFAULT_CODEX_MODEL)).strip(),
+        codex_ignore_user_config=bool(
+            config.get("ai", {}).get("codex_ignore_user_config", DEFAULT_CODEX_IGNORE_USER_CONFIG)
+        ),
+        claude_model=str(config.get("ai", {}).get("claude_model", DEFAULT_CLAUDE_MODEL)).strip(),
+        claude_effort=str(config.get("ai", {}).get("claude_effort", DEFAULT_CLAUDE_EFFORT)).strip(),
         jira_site_url=str(config["jira_site_url"]).rstrip("/"),
         jira_admin_email=str(config["jira_admin_email"]),
     )
@@ -1741,7 +1803,7 @@ def load_orchestrator_config(config_path: Path | None = None) -> dict[str, Any]:
                 {
                     key: value
                     for key, value in loaded.items()
-                    if key not in {"poll_intervals", "github", "listen_url", "shared_secret"}
+                    if key not in {"poll_intervals", "github", "ai", "listen_url", "shared_secret"}
                 }
             )
             if isinstance(loaded.get("poll_intervals"), dict):
@@ -1753,6 +1815,11 @@ def load_orchestrator_config(config_path: Path | None = None) -> dict[str, Any]:
                 config["github"] = {
                     **config["github"],
                     **loaded["github"],
+                }
+            if isinstance(loaded.get("ai"), dict):
+                config["ai"] = {
+                    **config["ai"],
+                    **loaded["ai"],
                 }
             if loaded.get("listen_url"):
                 apply_legacy_listen_url(config, str(loaded["listen_url"]))
@@ -1795,6 +1862,12 @@ def default_orchestrator_config() -> dict[str, Any]:
             "codex_review_authors": list(DEFAULT_CODEX_REVIEW_AUTHORS),
             "auto_review_grace_seconds": DEFAULT_AUTO_REVIEW_GRACE_SECONDS,
             "fallback_review_grace_seconds": DEFAULT_FALLBACK_REVIEW_GRACE_SECONDS,
+        },
+        "ai": {
+            "codex_model": DEFAULT_CODEX_MODEL,
+            "codex_ignore_user_config": DEFAULT_CODEX_IGNORE_USER_CONFIG,
+            "claude_model": DEFAULT_CLAUDE_MODEL,
+            "claude_effort": DEFAULT_CLAUDE_EFFORT,
         },
         "jira_site_url": jira_config.get("site_url", ""),
         "jira_admin_email": jira_config.get("admin_email", ""),
@@ -2501,6 +2574,7 @@ Output requirements:
 - jira_summary: short progress summary for Jira
 """.strip()
     result = run_claude_json(
+        settings=settings,
         store=store,
         issue_key=issue_key,
         cwd=worktree_path,
@@ -2537,6 +2611,7 @@ Review signal:
 Return JSON only and match the schema.
 """.strip()
     result = run_claude_json(
+        settings=settings,
         store=store,
         issue_key=issue_key,
         cwd=worktree_path,
@@ -2549,6 +2624,7 @@ Return JSON only and match the schema.
 
 def run_claude_json(
     *,
+    settings: WorkerSettings,
     store: OrchestratorStore,
     issue_key: str,
     cwd: Path,
@@ -2558,14 +2634,22 @@ def run_claude_json(
     argv = [
         "claude",
         "-p",
-        "--permission-mode",
-        "bypassPermissions",
-        "--output-format",
-        "json",
-        "--json-schema",
-        schema_path.read_text(encoding="utf-8"),
-        prompt,
     ]
+    if settings.claude_model:
+        argv.extend(["--model", settings.claude_model])
+    if settings.claude_effort:
+        argv.extend(["--effort", settings.claude_effort])
+    argv.extend(
+        [
+            "--permission-mode",
+            "bypassPermissions",
+            "--output-format",
+            "json",
+            "--json-schema",
+            schema_path.read_text(encoding="utf-8"),
+            prompt,
+        ]
+    )
     result = run_tracked_command(
         store,
         issue_key,
@@ -2607,10 +2691,9 @@ Return JSON matching the provided schema.
 Claude plan:
 {json.dumps(plan_payload, indent=2, ensure_ascii=False)}
 """.strip()
-    process = start_process(
+    argv = codex_exec_argv(settings)
+    argv.extend(
         [
-            "codex",
-            "exec",
             "--json",
             "--output-schema",
             str(schema),
@@ -2620,9 +2703,9 @@ Claude plan:
             "--cd",
             str(worktree_path),
             prompt,
-        ],
-        cwd=worktree_path,
+        ]
     )
+    process = start_process(argv, cwd=worktree_path)
     store.update_job(issue_key, active_pid=process.pid)
     try:
         stdout, stderr, timed_out = communicate_or_terminate(
@@ -2667,18 +2750,17 @@ def run_codex_review(
     worktree_path: Path,
 ) -> dict[str, Any]:
     stage_meaningful_changes(worktree_path)
-    process = start_process(
+    argv = codex_exec_argv(settings)
+    argv.extend(
         [
-            "codex",
-            "exec",
             "review",
             "--json",
             "--base",
             "main",
             "--dangerously-bypass-approvals-and-sandbox",
-        ],
-        cwd=worktree_path,
+        ]
     )
+    process = start_process(argv, cwd=worktree_path)
     store.update_job(issue_key, active_pid=process.pid)
     try:
         stdout, stderr, timed_out = communicate_or_terminate(
@@ -2711,6 +2793,15 @@ def run_codex_review(
         "fallback_used": False,
         "timed_out": False,
     }
+
+
+def codex_exec_argv(settings: WorkerSettings) -> list[str]:
+    argv = ["codex", "exec"]
+    if settings.codex_ignore_user_config:
+        argv.append("--ignore-user-config")
+    if settings.codex_model:
+        argv.extend(["--model", settings.codex_model])
+    return argv
 
 
 def ensure_pull_request(

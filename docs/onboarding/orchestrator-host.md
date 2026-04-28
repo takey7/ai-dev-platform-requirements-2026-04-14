@@ -53,8 +53,18 @@ Use the CLI to keep polling mode explicit:
 ./bin/platform orchestrator configure \
   --event-mode polling \
   --bind-host 127.0.0.1 \
-  --bind-port 8787
+  --bind-port 8787 \
+  --codex-model "" \
+  --codex-ignore-user-config \
+  --claude-model default \
+  --claude-effort ""
 ```
+
+Empty `--codex-model` tracks the Codex CLI built-in current default. Worker Codex subprocesses ignore `~/.codex/config.toml` by default so a personal model pin such as `model = "gpt-5.2"` cannot silently change production worker behavior. Use `--codex-use-user-config` only for a dedicated worker account where that inheritance is intentional.
+
+Use `--codex-model gpt-5.5 --codex-ignore-user-config` only when the worker intentionally pins Codex.
+
+Use `--claude-model best --claude-effort xhigh` only for a dedicated worker where the project explicitly wants the most capable available Claude model.
 
 ```json
 {
@@ -71,9 +81,15 @@ Use the CLI to keep polling mode explicit:
   },
   "github_mode": "polling",
   "github": {
-    "codex_review_authors": ["codex", "codex[bot]"],
+    "codex_review_authors": ["codex", "codex[bot]", "chatgpt-codex-connector"],
     "auto_review_grace_seconds": 180,
     "fallback_review_grace_seconds": 300
+  },
+  "ai": {
+    "codex_model": "",
+    "codex_ignore_user_config": true,
+    "claude_model": "default",
+    "claude_effort": ""
   },
   "jira_site_url": "https://<site>.atlassian.net",
   "jira_admin_email": "you@example.com"

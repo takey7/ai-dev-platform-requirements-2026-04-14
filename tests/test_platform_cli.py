@@ -93,6 +93,93 @@ class PlatformCliTests(unittest.TestCase):
 
         self.assertEqual(settings["jira_api_token"], "stored-token")
 
+    def test_resolve_setup_repo_settings_defaults_to_current_repo_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "Existing Service"
+            target.mkdir()
+            args = argparse.Namespace(
+                target=str(target),
+                project_name=None,
+                github_owner="takey7",
+                repo_name=None,
+                jira_key=None,
+                jira_name=None,
+                confluence_space=None,
+                source_repo="takey7/platform",
+                version="v1.0.0",
+                adapter="node-ts",
+                deploy_mode=None,
+                launch_mode="none",
+                skip_github_create=False,
+                skip_jira_create=False,
+                skip_register=False,
+                no_commit_push=False,
+                allow_dirty=False,
+                force=False,
+            )
+            config = {
+                "deploy_mode": "staging-prod",
+                "jira": {
+                    "site_url": "https://example.atlassian.net",
+                    "admin_email": "admin@example.com",
+                },
+            }
+            original_token = platform.platform_orchestrator.atlassian_api_token
+            try:
+                platform.platform_orchestrator.atlassian_api_token = lambda: "stored-token"
+                settings = platform.resolve_setup_repo_settings(args, config)
+            finally:
+                platform.platform_orchestrator.atlassian_api_token = original_token
+
+        self.assertEqual(settings["repo_name"], "existing-service")
+        self.assertEqual(settings["project_name"], "existing service")
+        self.assertEqual(settings["jira_key"], "ES")
+        self.assertEqual(settings["github_repo"], "takey7/existing-service")
+        self.assertEqual(settings["jira_api_token"], "stored-token")
+        self.assertTrue(settings["create_github"])
+        self.assertTrue(settings["create_jira"])
+        self.assertTrue(settings["register_orchestrator"])
+
+    def test_setup_repo_dirty_guard_blocks_existing_committed_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            (target / ".git").mkdir()
+            settings = {
+                "target": target,
+                "commit_and_push": True,
+                "allow_dirty": False,
+                "create_github": False,
+                "create_jira": False,
+                "force": False,
+                "register_orchestrator": False,
+                "launch_mode": "none",
+                "repo_name": "demo",
+            }
+            original_resolve = platform.resolve_setup_repo_settings
+            original_preflight = platform.preflight_setup_repo
+            original_ensure_git = platform.ensure_git_repository
+            original_has_commits = platform.git_has_commits
+            original_status = platform.git_status_porcelain
+            original_remote_url = platform.git_remote_url
+            try:
+                platform.resolve_setup_repo_settings = lambda _args, _config: settings
+                platform.preflight_setup_repo = lambda _settings: None
+                platform.ensure_git_repository = lambda _target: None
+                platform.git_has_commits = lambda _target: True
+                platform.git_status_porcelain = lambda _target: " M app.ts"
+                platform.git_remote_url = lambda _target: "https://github.com/takey7/demo.git"
+
+                code = platform.cmd_setup_repo(argparse.Namespace())
+            finally:
+                platform.resolve_setup_repo_settings = original_resolve
+                platform.preflight_setup_repo = original_preflight
+                platform.ensure_git_repository = original_ensure_git
+                platform.git_has_commits = original_has_commits
+                platform.git_status_porcelain = original_status
+                platform.git_remote_url = original_remote_url
+
+        self.assertEqual(code, 1)
+
     def test_new_spec_rejects_foreign_project_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir)

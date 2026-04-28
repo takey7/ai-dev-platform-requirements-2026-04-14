@@ -208,6 +208,73 @@ def build_parser() -> argparse.ArgumentParser:
     )
     create_project.set_defaults(func=cmd_create_project)
 
+    setup_repo = subparsers.add_parser(
+        "setup-repo",
+        help="Provision GitHub/Jira and bootstrap an existing local repository.",
+    )
+    setup_repo.add_argument("--target", default=".", help="Existing repository path to set up.")
+    setup_repo.add_argument(
+        "--project-name",
+        default=None,
+        help="Human-readable project name. Defaults to the target directory name.",
+    )
+    setup_repo.add_argument("--github-owner", default=None, help="Override GitHub owner or org.")
+    setup_repo.add_argument("--repo-name", default=None, help="Override generated repository name.")
+    setup_repo.add_argument("--jira-key", default=None, help="Override generated Jira project key.")
+    setup_repo.add_argument("--jira-name", default=None, help="Override Jira project display name.")
+    setup_repo.add_argument("--confluence-space", default=None, help="Override Confluence space key.")
+    setup_repo.add_argument("--source-repo", default=None, help="Override platform source repo.")
+    setup_repo.add_argument("--version", default=None, help="Override platform version or ref.")
+    setup_repo.add_argument(
+        "--adapter",
+        choices=["node-ts"],
+        default=None,
+        help="Override adapter for this repo.",
+    )
+    setup_repo.add_argument(
+        "--deploy-mode",
+        choices=["none", "staging-only", "staging-prod"],
+        default=None,
+        help="Override deploy mode recorded in the manifest.",
+    )
+    setup_repo.add_argument(
+        "--launch-mode",
+        choices=["tmux", "none"],
+        default=None,
+        help="Override post-setup launch mode.",
+    )
+    setup_repo.add_argument(
+        "--skip-github-create",
+        action="store_true",
+        help="Do not create or attach a GitHub private repo. Use the existing origin if any.",
+    )
+    setup_repo.add_argument(
+        "--skip-jira-create",
+        action="store_true",
+        help="Do not create a Jira Kanban project. Requires a usable --jira-key.",
+    )
+    setup_repo.add_argument(
+        "--skip-register",
+        action="store_true",
+        help="Do not register the repo with the polling orchestrator.",
+    )
+    setup_repo.add_argument(
+        "--no-commit-push",
+        action="store_true",
+        help="Apply files locally but do not commit or push.",
+    )
+    setup_repo.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Allow commit/push even when an existing committed repo had local changes before setup.",
+    )
+    setup_repo.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite platform-managed files when they already exist.",
+    )
+    setup_repo.set_defaults(func=cmd_setup_repo)
+
     doctor = subparsers.add_parser(
         "doctor", help="Validate a repository against the platform baseline."
     )
@@ -407,6 +474,92 @@ def cmd_create_project(args: argparse.Namespace) -> int:
                 "Keeping partial assets for manual follow-up.",
                 file=sys.stderr,
             )
+        return 1
+
+
+def cmd_setup_repo(args: argparse.Namespace) -> int:
+    config = load_user_config()
+    settings = resolve_setup_repo_settings(args, config)
+    session_name: str | None = None
+
+    try:
+        preflight_setup_repo(settings)
+        ensure_git_repository(settings["target"])
+
+        had_commits = git_has_commits(settings["target"])
+        dirty_before = git_status_porcelain(settings["target"])
+        if not settings["create_github"] and settings["commit_and_push"] and not git_remote_url(settings["target"]):
+            raise PlatformCommandError(
+                "--skip-github-create requires an existing origin when commit/push is enabled. "
+                "Configure origin first or re-run with --no-commit-push."
+            )
+        if settings["commit_and_push"] and had_commits and dirty_before and not settings["allow_dirty"]:
+            raise PlatformCommandError(
+                "Target repo has uncommitted changes before setup. Commit/stash them first, "
+                "or re-run with --allow-dirty if you intentionally want setup to commit them."
+            )
+
+        if settings["create_jira"]:
+            settings["jira_lead_account_id"] = jira_current_user_account_id(
+                site_url=settings["jira_site_url"],
+                admin_email=settings["jira_admin_email"],
+                api_token=settings["jira_api_token"],
+            )
+            settings["jira_key"] = jira_valid_project_key(
+                site_url=settings["jira_site_url"],
+                admin_email=settings["jira_admin_email"],
+                api_token=settings["jira_api_token"],
+                requested_key=settings["jira_key"],
+            )
+            settings["jira_name"] = jira_valid_project_name(
+                site_url=settings["jira_site_url"],
+                admin_email=settings["jira_admin_email"],
+                api_token=settings["jira_api_token"],
+                requested_name=settings["jira_name"],
+            )
+            if not settings.get("confluence_space"):
+                settings["confluence_space"] = settings["jira_key"]
+            settings["jira_project"] = create_jira_project(settings)
+        elif not settings.get("confluence_space"):
+            settings["confluence_space"] = settings["jira_key"]
+
+        if settings["create_github"]:
+            ensure_github_remote(settings)
+
+        context = bootstrap_repository(
+            target=settings["target"],
+            adapter=settings["adapter"],
+            service_name=settings["service_name"],
+            issue_project_key=settings["jira_key"],
+            confluence_space=settings["confluence_space"],
+            source_repo=settings["source_repo"],
+            source_ref=settings["source_ref"],
+            deploy_mode=settings["deploy_mode"],
+            overwrite=settings["force"],
+            include_adapter_starter=True,
+            existing_manifest=None,
+        )
+        ensure_doctor_passes(settings["target"])
+
+        if settings["commit_and_push"]:
+            commit_and_push_setup_repo(settings["target"])
+
+        if settings["register_orchestrator"]:
+            ensure_orchestrator_project_root(settings["target"].parent)
+            register_orchestrator_project(settings["target"])
+
+        if settings["launch_mode"] == "tmux":
+            session_name = launch_tmux_workspace(settings["target"], settings["repo_name"])
+
+        print_setup_repo_summary(settings, context, session_name)
+        return 0
+    except (PlatformCommandError, platform_orchestrator.OrchestratorError) as exc:
+        print(str(exc), file=sys.stderr)
+        print(
+            "Partial assets are kept. Re-run `platform setup-repo --target <repo> --force` "
+            "after resolving the issue, or clean up GitHub/Jira manually if needed.",
+            file=sys.stderr,
+        )
         return 1
 
 
@@ -873,6 +1026,58 @@ def resolve_create_project_settings(
     }
 
 
+def resolve_setup_repo_settings(
+    args: argparse.Namespace, config: dict[str, Any]
+) -> dict[str, Any]:
+    target = Path(args.target).expanduser().resolve()
+    repo_name = args.repo_name or slugify(target.name)
+    project_name = normalize_project_name(args.project_name or repo_name.replace("-", " "))
+    github_owner = args.github_owner or config.get("github_owner") or infer_active_github_owner()
+    if not github_owner and not args.skip_github_create:
+        raise PlatformCommandError(
+            "GitHub owner could not be resolved. Pass --github-owner or run "
+            "`platform configure --github-owner <owner>` first."
+        )
+
+    source_repo = args.source_repo or config.get("source_repo") or infer_default_source_repo()
+    source_ref = args.version or config.get("source_ref") or resolve_latest_source_ref(source_repo)
+    adapter = args.adapter or config.get("adapter") or DEFAULT_ADAPTER
+    deploy_mode = args.deploy_mode or config.get("deploy_mode") or DEFAULT_DEPLOY_MODE
+    launch_mode = args.launch_mode or config.get("launch_mode") or DEFAULT_LAUNCH_MODE
+    jira_config = config.get("jira", {})
+    jira_site_url = normalize_site_url(jira_config.get("site_url", ""))
+    jira_admin_email = jira_config.get("admin_email", "")
+    jira_name = normalize_project_name(args.jira_name or project_name)
+    jira_key = (args.jira_key or generate_jira_project_key_candidate(repo_name)).upper()
+    confluence_space = args.confluence_space.upper() if args.confluence_space else None
+
+    return {
+        "project_name": project_name,
+        "repo_name": repo_name,
+        "service_name": repo_name,
+        "github_owner": github_owner or "",
+        "target": target,
+        "github_repo": f"{github_owner}/{repo_name}" if github_owner else "",
+        "source_repo": source_repo,
+        "source_ref": source_ref,
+        "adapter": adapter,
+        "deploy_mode": deploy_mode,
+        "launch_mode": launch_mode,
+        "jira_site_url": jira_site_url,
+        "jira_admin_email": jira_admin_email,
+        "jira_key": jira_key,
+        "jira_name": jira_name,
+        "confluence_space": confluence_space,
+        "jira_api_token": platform_orchestrator.atlassian_api_token(),
+        "create_github": not args.skip_github_create,
+        "create_jira": not args.skip_jira_create,
+        "register_orchestrator": not args.skip_register,
+        "commit_and_push": not args.no_commit_push,
+        "allow_dirty": args.allow_dirty,
+        "force": args.force,
+    }
+
+
 def preflight_create_project(settings: dict[str, Any]) -> None:
     required_tools = ["git", "gh", "python3", "claude", "codex"]
     if settings["adapter"] == "node-ts":
@@ -939,6 +1144,76 @@ def preflight_create_project(settings: dict[str, Any]) -> None:
         raise PlatformCommandError(f"tmux session already exists: {settings['repo_name']}")
 
 
+def preflight_setup_repo(settings: dict[str, Any]) -> None:
+    required_tools = ["git", "gh", "python3", "claude", "codex"]
+    if settings["adapter"] == "node-ts":
+        required_tools.extend(["node", "pnpm"])
+    if settings["launch_mode"] == "tmux":
+        required_tools.append("tmux")
+    missing = [tool for tool in required_tools if shutil.which(tool) is None]
+    if missing:
+        raise PlatformCommandError(
+            "Missing required tools for setup-repo: " + ", ".join(sorted(missing))
+        )
+
+    target = settings["target"]
+    if not target.exists() or not target.is_dir():
+        raise PlatformCommandError(f"Target directory does not exist: {target}")
+    manifest_path = target / ".platform" / "platform.yaml"
+    if manifest_path.exists() and not settings["force"]:
+        raise PlatformCommandError(
+            f"{manifest_path} already exists. Re-run with --force or use `platform upgrade`."
+        )
+
+    if settings["create_jira"]:
+        if not settings["jira_site_url"]:
+            raise PlatformCommandError(
+                "Jira site URL is missing. Run `platform configure --jira-site-url https://<site>.atlassian.net`."
+            )
+        if not settings["jira_admin_email"]:
+            raise PlatformCommandError(
+                "Jira admin email is missing. Run `platform configure --jira-admin-email <email>`."
+            )
+        if not settings["jira_api_token"]:
+            raise PlatformCommandError(
+                "ATLASSIAN_API_TOKEN is missing. Export it or store it in macOS Keychain service "
+                f"`{platform_orchestrator.ATLASSIAN_TOKEN_KEYCHAIN_SERVICE}` before running "
+                "`platform setup-repo`."
+            )
+
+    gh_status = run_optional(["gh", "auth", "status"])
+    if not gh_status or gh_status.returncode != 0:
+        raise PlatformCommandError("GitHub CLI is not authenticated. Run `gh auth login`.")
+
+    claude_status = run_optional(["claude", "auth", "status"])
+    if not claude_status or claude_status.returncode != 0:
+        raise PlatformCommandError("Claude auth could not be verified. Run `claude auth login --claudeai`.")
+    try:
+        claude_payload = json.loads(claude_status.stdout)
+    except json.JSONDecodeError:
+        claude_payload = {}
+    if not claude_payload.get("loggedIn", False):
+        raise PlatformCommandError("Claude is not logged in. Run `claude auth login --claudeai`.")
+
+    codex_status = run_optional(["codex", "login", "status"])
+    codex_output = ""
+    if codex_status:
+        codex_output = f"{codex_status.stdout}\n{codex_status.stderr}".lower()
+    if not codex_status or codex_status.returncode != 0 or "logged in" not in codex_output or "chatgpt" not in codex_output:
+        raise PlatformCommandError("Codex is not using ChatGPT login. Run `codex login`.")
+
+    if settings["commit_and_push"]:
+        git_name = run_optional(["git", "config", "--global", "user.name"])
+        git_email = run_optional(["git", "config", "--global", "user.email"])
+        if not git_name or git_name.returncode != 0 or not git_name.stdout.strip():
+            raise PlatformCommandError("Git user.name is missing. Configure it before setup-repo.")
+        if not git_email or git_email.returncode != 0 or not git_email.stdout.strip():
+            raise PlatformCommandError("Git user.email is missing. Configure it before setup-repo.")
+
+    if settings["launch_mode"] == "tmux" and tmux_session_exists(settings["repo_name"]):
+        raise PlatformCommandError(f"tmux session already exists: {settings['repo_name']}")
+
+
 def create_github_repository(settings: dict[str, Any]) -> None:
     args = [
         "gh",
@@ -965,6 +1240,72 @@ def prepare_local_git_repository(target: Path) -> None:
     run_command(["git", "checkout", "-B", "main"], cwd=target)
 
 
+def ensure_git_repository(target: Path) -> None:
+    if not (target / ".git").exists():
+        run_command(["git", "init"], cwd=target)
+        run_command(["git", "checkout", "-B", "main"], cwd=target)
+        return
+    if not git_has_commits(target):
+        run_command(["git", "checkout", "-B", "main"], cwd=target)
+
+
+def ensure_github_remote(settings: dict[str, Any]) -> None:
+    target = settings["target"]
+    desired_repo = settings["github_repo"]
+    origin_url = git_remote_url(target)
+    if origin_url:
+        existing_repo = repo_full_name_from_remote_url(origin_url)
+        if existing_repo and existing_repo.lower() != desired_repo.lower():
+            raise PlatformCommandError(
+                f"origin already points to `{existing_repo}`, not `{desired_repo}`. "
+                "Use --skip-github-create to keep the existing remote, or choose matching --github-owner/--repo-name."
+            )
+        print(f"GitHub repo: using existing origin {origin_url}")
+        return
+    if github_repo_exists(desired_repo):
+        raise PlatformCommandError(
+            f"GitHub repository already exists: {desired_repo}. "
+            "Clone that repo first or use --skip-github-create with the correct origin."
+        )
+    create_github_repository({**settings, "root": target.parent})
+    run_command(["git", "remote", "add", "origin", f"https://github.com/{desired_repo}.git"], cwd=target)
+
+
+def git_has_commits(target: Path) -> bool:
+    result = run_optional(["git", "rev-parse", "--verify", "HEAD"], cwd=target)
+    return bool(result and result.returncode == 0)
+
+
+def git_status_porcelain(target: Path) -> str:
+    result = run_optional(["git", "status", "--porcelain"], cwd=target)
+    if not result or result.returncode != 0:
+        raise PlatformCommandError(f"Could not inspect git status for {target}.")
+    return result.stdout.strip()
+
+
+def git_current_branch(target: Path) -> str:
+    result = run_optional(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=target)
+    if result and result.returncode == 0:
+        branch = result.stdout.strip()
+        if branch and branch != "HEAD":
+            return branch
+    return "main"
+
+
+def git_remote_url(target: Path) -> str:
+    result = run_optional(["git", "remote", "get-url", "origin"], cwd=target)
+    if result and result.returncode == 0:
+        return result.stdout.strip()
+    return ""
+
+
+def repo_full_name_from_remote_url(value: str) -> str | None:
+    match = re.search(r"github\.com[:/](?P<owner>[^/]+)/(?P<repo>[^/.]+)(?:\.git)?$", value)
+    if not match:
+        return None
+    return f"{match.group('owner')}/{match.group('repo')}"
+
+
 def install_adapter_dependencies(target: Path, adapter: str) -> None:
     if adapter == "node-ts" and (target / "package.json").exists():
         run_command(["pnpm", "install"], cwd=target)
@@ -981,6 +1322,46 @@ def commit_and_push_initial_repo(target: Path) -> None:
     run_command(["git", "add", "."], cwd=target)
     run_command(["git", "commit", "-m", "Bootstrap platform baseline"], cwd=target)
     run_command(["git", "push", "-u", "origin", "main"], cwd=target)
+
+
+def commit_and_push_setup_repo(target: Path) -> None:
+    if not git_remote_url(target):
+        raise PlatformCommandError("Cannot push setup commit because origin is not configured.")
+    run_command(["git", "add", "."], cwd=target)
+    diff = run_optional(["git", "diff", "--cached", "--quiet"], cwd=target)
+    if diff and diff.returncode == 0:
+        print("No setup changes to commit.")
+    else:
+        run_command(["git", "commit", "-m", "Bootstrap platform baseline"], cwd=target)
+    branch = git_current_branch(target)
+    run_command(["git", "push", "-u", "origin", branch], cwd=target)
+
+
+def ensure_orchestrator_project_root(root: Path) -> None:
+    config_path = platform_orchestrator.default_config_path()
+    config = platform_orchestrator.load_orchestrator_config(config_path)
+    roots = [str(Path(item).expanduser().resolve()) for item in config.get("projects_roots", [])]
+    resolved = str(root.expanduser().resolve())
+    if resolved not in roots:
+        roots.append(resolved)
+        config["projects_roots"] = roots
+        platform_orchestrator.save_orchestrator_config(config, config_path)
+
+
+def register_orchestrator_project(target: Path) -> None:
+    args = argparse.Namespace(
+        target=str(target),
+        config=None,
+        bind_host=None,
+        bind_port=None,
+        event_mode="polling",
+        webhook=False,
+        public_base_url=None,
+        webhook_secret=None,
+        listen_url=None,
+        shared_secret=None,
+    )
+    platform_orchestrator.cmd_register(args)
 
 
 def create_jira_project(settings: dict[str, Any]) -> dict[str, Any]:
@@ -1043,6 +1424,27 @@ def print_create_project_summary(
     print(f"- Confluence space: {settings['confluence_space']}")
     print(f"- adapter: {context['ADAPTER']}")
     print(f"- workflow ref: {context['SOURCE_REF']}")
+    if session_name:
+        print(f"- tmux session: {session_name}")
+
+
+def print_setup_repo_summary(
+    settings: dict[str, Any], context: dict[str, str], session_name: str | None
+) -> None:
+    print("Setup-repo complete")
+    repo_label = (
+        settings["github_repo"]
+        if settings["create_github"]
+        else infer_repo_full_name(settings["target"]) or "existing local repo (GitHub creation skipped)"
+    )
+    print(f"- repo: {repo_label}")
+    print(f"- local path: {settings['target']}")
+    print(f"- Jira project: {settings['jira_key']} ({settings['jira_name']})")
+    print(f"- Confluence space: {settings['confluence_space']}")
+    print(f"- adapter: {context['ADAPTER']}")
+    print(f"- workflow ref: {context['SOURCE_REF']}")
+    print(f"- committed/pushed: {'yes' if settings['commit_and_push'] else 'no'}")
+    print(f"- orchestrator registered: {'yes' if settings['register_orchestrator'] else 'no'}")
     if session_name:
         print(f"- tmux session: {session_name}")
 
