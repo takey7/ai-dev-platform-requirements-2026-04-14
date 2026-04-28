@@ -3,3 +3,5 @@ dist/
 coverage/
 __pycache__/
 .DS_Store
+.tmp/
+.platform/.last-validation.json

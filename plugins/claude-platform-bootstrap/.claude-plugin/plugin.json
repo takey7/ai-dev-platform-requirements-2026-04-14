@@ -1,6 +1,6 @@
 {
   "name": "claude-platform-bootstrap",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Call the shared platform CLI from Claude Code without duplicating bootstrap logic.",
   "author": {
     "name": "Platform Team"

@@ -1,0 +1,231 @@
+# New Project To Startup Manual
+
+この手順は、**新しい repo を作るところから resident orchestrator を起動して Jira issue を流し始めるところまで**を対象にした運用マニュアルです。
+
+## 0. 前提
+- source repo: `/Users/jin/Downloads/ai-dev-platform-requirements-2026-04-14`
+- formal entrypoint: `./bin/platform`
+- Jira 既定テンプレート: `Kanban`
+- Claude / Codex は login-based auth
+- Jira project 作成や Automation rule 登録だけ `ATLASSIAN_API_TOKEN` を使う
+
+## 1. ローカル認証
+```bash
+gh auth status
+claude auth status
+codex login status
+```
+
+未ログインなら:
+```bash
+gh auth login
+claude auth login --claudeai
+codex login
+```
+
+## 2. user config を 1 回だけ保存する
+```bash
+cd /Users/jin/Downloads/ai-dev-platform-requirements-2026-04-14
+
+./bin/platform configure \
+  --github-owner <github-owner> \
+  --projects-root ~/workspaces \
+  --jira-site-url https://<site>.atlassian.net \
+  --jira-admin-email <jira-admin-email> \
+  --launch-mode tmux
+```
+
+Jira provisioning が必要なターンだけ token を export:
+```bash
+export ATLASSIAN_API_TOKEN=<jira-admin-token>
+```
+
+## 3. 新規 repo / Jira project を一気に作る
+```bash
+./bin/platform create-project "Billing API" \
+  --repo-name billing-api \
+  --jira-key BILL \
+  --jira-name "Billing API" \
+  --confluence-space BILL
+```
+
+このコマンドで行われること:
+- GitHub private repo を作る
+- local repo を clone する
+- baseline を bootstrap する
+- Node/TypeScript adapter を入れる
+- `pnpm install` と `platform doctor` を通す
+- 初回 commit / push を行う
+- Jira Software Kanban project を作る
+- `tmux` で `dev / claude / codex` を起動する
+
+確認ポイント:
+```bash
+gh repo view <owner>/<repo>
+tmux list-sessions
+cat ~/workspaces/<repo-name>/.platform/platform.yaml
+```
+
+## 4. 固定 URL worker host を用意する
+恒久運用では Linux VM + Caddy + systemd を使います。詳細は [orchestrator-host.md](orchestrator-host.md) を参照してください。
+
+テスト時の最小要件:
+- public HTTPS URL がある
+- worker は `127.0.0.1:<port>` で bind
+- public URL は `public_base_url` と一致
+
+worker config の確認:
+```bash
+cat ~/.config/ai-dev-platform/orchestrator.json
+```
+
+最低限必要な項目:
+- `bind_host`
+- `bind_port`
+- `public_base_url`
+- `projects_roots`
+- `jira_site_url`
+- `jira_admin_email`
+
+## 5. consuming repo を worker に登録する
+```bash
+./bin/platform orchestrator register \
+  --target ~/workspaces/<repo-name> \
+  --public-base-url https://orchestrator.<domain>
+```
+
+このコマンドで行われること:
+- `projects_roots[]` に repo 親ディレクトリを追加
+- Jira control issue を作成または再利用
+- project 固有 endpoint を作る
+  - `POST /jira/events/<PROJECT_KEY>`
+- project ごとの webhook secret を払い出す
+- Jira Automation rule を 2 本作成または更新
+  - `<PROJECT_KEY> / AI lifecycle`
+  - `<PROJECT_KEY> / AI comments`
+
+複数 project を同じ worker に載せる場合も同じです。
+```bash
+./bin/platform orchestrator register --target ~/workspaces/repo-a --public-base-url https://orchestrator.<domain>
+./bin/platform orchestrator register --target ~/workspaces/repo-b --public-base-url https://orchestrator.<domain>
+```
+
+## 6. worker を起動する
+```bash
+./bin/platform orchestrator run
+```
+
+別ターミナルで確認:
+```bash
+curl https://orchestrator.<domain>/healthz
+./bin/platform orchestrator status --project <PROJECT_KEY>
+```
+
+## 7. Jira issue を作る
+通常運用では **Claude + MCP** を使います。CLI 追加コマンドは使いません。
+
+ポリシー:
+- Jira issue 作成は **明示指示のときだけ**
+- 作成先は repo 固定 `issue.project_key`
+- 既定 issue type は `Task`
+
+例:
+```bash
+cd ~/workspaces/<repo-name>
+
+claude -p --permission-mode bypassPermissions \
+  "In this repository, create a Jira Task in the repo's fixed Jira project. Title: 'Add queue health note'. Return only the created issue key and title."
+```
+
+## 8. orchestrator に着手させる
+対象 issue に `ai:auto` を付けます。status は `To Do` または `Selected for Development` を使います。
+
+その後 worker は:
+1. Jira issue を読む
+2. `docs/specs/<ISSUE>.md` を生成する
+3. worktree と branch を作る
+4. Claude planning -> Codex coding/review -> Claude integrate を回す
+5. PR を作る
+6. GitHub checks を待つ
+7. Codex review artifact を待つ
+8. `ready_for_merge` か `blocked` を Jira sticky comment に返す
+
+## 9. 日常の監視と操作
+status:
+```bash
+./bin/platform orchestrator status --project <PROJECT_KEY>
+./bin/platform orchestrator status --issue <ISSUE_KEY>
+```
+
+CLI pause/resume/cancel:
+```bash
+./bin/platform orchestrator pause --issue <ISSUE_KEY>
+./bin/platform orchestrator resume --issue <ISSUE_KEY>
+./bin/platform orchestrator cancel --issue <ISSUE_KEY>
+```
+
+Jira comment control:
+- `/ai pause`
+- `/ai resume`
+- `/ai cancel`
+- `/ai retry`
+- `/ai status`
+
+project-wide:
+- `/ai pause-project`
+- `/ai resume-project`
+- `/ai drain-project`
+
+## 10. GitHub review の確認
+repo 側では automatic Codex review を有効化します。
+
+worker の動作:
+1. PR 作成
+2. required checks 待ち
+3. real Codex review artifact 待ち
+4. 来なければ `@codex review` fallback
+5. それでも来なければ Jira に `blocked` を返す
+
+確認コマンド:
+```bash
+gh pr list -R <owner>/<repo> --state all --json number,title,reviews,reviewDecision,statusCheckRollup
+./bin/platform doctor --target ~/workspaces/<repo-name>
+```
+
+worker が止まっていた場合は、GitHub 状態を手動で再取得します。
+
+```bash
+./bin/platform orchestrator poll --issue <ISSUE_KEY>
+./bin/platform orchestrator status --issue <ISSUE_KEY>
+```
+
+`@codex review` の comment だけでは完了扱いにしません。GitHub 上の real review artifact が無い場合は、一定時間後に Jira へ `blocked` として書き戻します。
+
+## 11. 複数 project で混ざらないことの確認
+以下を project ごとに確認します。
+- Jira endpoint が `/jira/events/<PROJECT_KEY>` になっている
+- webhook secret が project ごとに違う
+- branch 名がその issue key を含む
+- worktree path が `.../worktrees/<PROJECT_KEY>/.../<ISSUE_KEY>` になっている
+- sticky comment の branch / PR URL がその repo だけを指す
+- 他 repo の PR や Jira issue key が混ざらない
+
+## 12. 失敗時の切り分け
+- healthz が落ちる:
+  - worker bind / reverse proxy / public URL を確認
+- Jira event が来ない:
+  - Automation rule の URL / secret / project scope を確認
+- Jira issue は読めるが PR が出ない:
+  - `platform orchestrator status`
+  - worktree の `git status`
+  - `gh pr list`
+- review が返らない:
+  - repo 側の automatic Codex review 設定
+  - fallback `@codex review` comment の有無
+
+## 13. 実運用の既定
+- 1 repo = 1 Jira project/space
+- Jira は Kanban
+- Claude の Jira issue 作成は explicit-only
+- Codex review は automatic review を正道、`@codex review` は fallback
+- Worker は `ready_for_merge` で止まり、merge は人または GitHub rules に委ねる

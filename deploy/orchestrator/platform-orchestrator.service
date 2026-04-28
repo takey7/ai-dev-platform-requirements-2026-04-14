@@ -1,0 +1,23 @@
+[Unit]
+Description=AI Development Platform Orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=platform-orchestrator
+Group=platform-orchestrator
+WorkingDirectory=/opt/ai-dev-platform-source
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-/etc/platform-orchestrator.env
+ExecStart=/opt/ai-dev-platform-source/bin/platform orchestrator run
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/platform-orchestrator/.config /home/platform-orchestrator/.local/state /srv/workspaces
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "required": [
+    "next_action",
+    "summary",
+    "blocker"
+  ],
+  "properties": {
+    "next_action": {
+      "type": "string",
+      "enum": [
+        "open_pr",
+        "retry_coding",
+        "blocked"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "blocker": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

@@ -192,7 +192,8 @@
           "required": [
             "source_repo",
             "workflow_ref",
-            "template_repository"
+            "template_repository",
+            "codex_review"
           ],
           "properties": {
             "source_repo": {
@@ -205,6 +206,22 @@
             },
             "template_repository": {
               "type": "boolean"
+            },
+            "codex_review": {
+              "type": "object",
+              "required": [
+                "mode"
+              ],
+              "properties": {
+                "mode": {
+                  "type": "string",
+                  "enum": [
+                    "auto_required",
+                    "comment_fallback"
+                  ]
+                }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false

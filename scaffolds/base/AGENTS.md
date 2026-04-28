@@ -12,6 +12,8 @@
 - Jira project key: {{ISSUE_PROJECT_KEY}}
 - Confluence space: {{CONFLUENCE_SPACE}}
 - Default issue prefix in branches: {{ISSUE_PROJECT_KEY}}
+- Orchestrator start label: `ai:auto`
+- Orchestrator control commands: `/ai pause`, `/ai resume`, `/ai cancel`, `/ai retry`, `/ai status`
 
 ## Atlassian scope policy
 - Only access Jira work in project `{{ISSUE_PROJECT_KEY}}`
@@ -19,6 +21,11 @@
 - Do not search, list, or summarize across all Jira projects or all Confluence spaces
 - Start Jira searches with `project = {{ISSUE_PROJECT_KEY}}`
 - Treat any other Jira project or Confluence space as out of scope unless the user explicitly names it and asks for cross-project work
+- Create Jira issues only when the user explicitly instructs you to do so
+- Any Jira issue you create must target project `{{ISSUE_PROJECT_KEY}}`
+- Default Jira issue type for explicit issue creation is `Task`
+- The resident orchestrator may only start work from Jira issues labeled `ai:auto` in project `{{ISSUE_PROJECT_KEY}}`
+- The project control issue is reserved for `/ai pause-project`, `/ai resume-project`, and `/ai drain-project`
 
 ## Required commands
 - Install: `{{INSTALL_COMMAND}}`
@@ -89,3 +96,4 @@ Before considering work done, run:
 - Focus on changed files only
 - For docs-only PRs, treat typos as P2 unless explicitly configured otherwise
 - For API/schema/auth/infra changes, prioritize hidden breakage and rollback risk
+- The repo default is automatic Codex review; `@codex review` is only a fallback if no Codex review artifact arrives

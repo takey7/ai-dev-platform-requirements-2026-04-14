@@ -1,0 +1,15 @@
+orchestrator.example.com {
+  encode gzip zstd
+
+  @health path /healthz
+  handle @health {
+    reverse_proxy 127.0.0.1:8787
+  }
+
+  @jira path_regexp jiraEvents ^/jira/events/[A-Za-z][A-Za-z0-9]+$
+  handle @jira {
+    reverse_proxy 127.0.0.1:8787
+  }
+
+  respond 404
+}
