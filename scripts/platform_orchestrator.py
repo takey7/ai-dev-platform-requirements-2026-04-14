@@ -139,6 +139,33 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
         dest="orchestrator_command", required=True
     )
 
+    configure = orchestrator_subparsers.add_parser(
+        "configure",
+        help="Update resident worker host settings such as the fixed public callback URL.",
+    )
+    configure.add_argument("--config", default=None, help="Override the worker config path.")
+    configure.add_argument("--bind-host", default=None, help="HTTP bind host for the worker.")
+    configure.add_argument("--bind-port", type=int, default=None, help="HTTP bind port for the worker.")
+    configure.add_argument(
+        "--public-base-url",
+        default=None,
+        help="Fixed public HTTPS base URL used by Jira Automation callbacks.",
+    )
+    configure.add_argument(
+        "--clear-public-base-url",
+        action="store_true",
+        help="Clear the public callback URL so live Jira callbacks are not configured.",
+    )
+    configure.add_argument(
+        "--project-root",
+        action="append",
+        default=None,
+        help="Add a projects root scanned by the worker.",
+    )
+    configure.add_argument("--jira-site-url", default=None, help="Atlassian Cloud site URL.")
+    configure.add_argument("--jira-admin-email", default=None, help="Jira admin email.")
+    configure.set_defaults(func=cmd_configure)
+
     run = orchestrator_subparsers.add_parser(
         "run",
         help="Run the resident worker that consumes Jira events and drives Claude/Codex/GitHub.",
@@ -261,6 +288,38 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     cancel.add_argument("--config", default=None, help="Override the worker config path.")
     cancel.add_argument("--issue", required=True, help="Issue key to cancel.")
     cancel.set_defaults(func=cmd_cancel)
+
+
+def cmd_configure(args: argparse.Namespace) -> int:
+    config_path = Path(args.config).expanduser() if args.config else default_config_path()
+    config = load_orchestrator_config(config_path)
+    if args.bind_host is not None:
+        config["bind_host"] = args.bind_host
+    if args.bind_port is not None:
+        config["bind_port"] = args.bind_port
+    if args.clear_public_base_url:
+        config["public_base_url"] = ""
+    if args.public_base_url is not None:
+        config["public_base_url"] = normalize_public_base_url(args.public_base_url)
+    if args.project_root:
+        roots = [str(Path(item).expanduser().resolve()) for item in config.get("projects_roots", [])]
+        for root in args.project_root:
+            resolved = str(Path(root).expanduser().resolve())
+            if resolved not in roots:
+                roots.append(resolved)
+        config["projects_roots"] = roots
+    if args.jira_site_url is not None:
+        config["jira_site_url"] = normalize_public_base_url(args.jira_site_url)
+    if args.jira_admin_email is not None:
+        config["jira_admin_email"] = args.jira_admin_email
+    save_orchestrator_config(config, config_path)
+    print(f"Saved orchestrator config: {config_path}")
+    print(json.dumps(config, indent=2, ensure_ascii=False))
+    if config.get("public_base_url"):
+        print("Re-run `platform orchestrator register --target <repo>` for each project to update Jira Automation callbacks.")
+    else:
+        print("Live Jira Automation callback setup is disabled until public_base_url is set.")
+    return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:

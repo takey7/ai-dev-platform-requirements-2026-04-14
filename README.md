@@ -118,6 +118,15 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
 ```
 
 ### 8. Jira 駆動の常駐オーケストレータを登録する
+恒久運用では、先に固定公開 URL を worker config に保存します。
+
+```bash
+./bin/platform orchestrator configure \
+  --public-base-url https://orchestrator.<domain> \
+  --bind-host 127.0.0.1 \
+  --bind-port 8787
+```
+
 ```bash
 ./bin/platform orchestrator register \
   --target /path/to/consumer-repo
@@ -144,6 +153,13 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
 - `ai:auto` + ready status (`To Do`, `Selected for Development`) の issue を対象にする
 - `ready_for_merge` で停止し、merge は人か既存 GitHub ルールに委ねる
 - 恒久運用では `deploy/orchestrator/` の `systemd` unit と `Caddyfile` を使い、固定 URL で公開する
+
+### 10. GitHub/Codex review を確認する
+```bash
+./bin/platform codex-review --target /path/to/consumer-repo --open-settings
+```
+
+Codex GitHub review の有効化は ChatGPT/Codex settings 側の repo 単位トグルです。CLI は設定画面を開き、認証、PR review artifact、`@codex review` fallback を検査します。
 
 ### 10. status / pause / resume / cancel
 ```bash

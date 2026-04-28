@@ -50,6 +50,15 @@ sudo systemctl enable --now platform-orchestrator
 3. Point the reverse proxy to the worker bind address from `orchestrator.json`.
 
 ## Recommended worker config
+Use the CLI to write the durable callback URL:
+
+```bash
+./bin/platform orchestrator configure \
+  --public-base-url https://orchestrator.<domain> \
+  --bind-host 127.0.0.1 \
+  --bind-port 8787
+```
+
 ```json
 {
   "version": 2,

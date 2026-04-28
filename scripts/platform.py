@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import webbrowser
 from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
@@ -30,6 +31,9 @@ DEFAULT_DEPLOY_MODE = "staging-prod"
 DEFAULT_LAUNCH_MODE = "tmux"
 DEFAULT_CODEX_REVIEW_MODE = "auto_required"
 DEFAULT_CODEX_REVIEW_AUTHORS = ("codex", "codex[bot]")
+CODEX_CODE_REVIEW_SETTINGS_URL = "https://chatgpt.com/codex/settings/code-review"
+OPENAI_CODEX_GITHUB_DOC_URL = "https://developers.openai.com/codex/integrations/github"
+OPENAI_CODEX_CLOUD_DOC_URL = "https://developers.openai.com/codex/cloud"
 CONFIG_VERSION = 1
 USER_CONFIG_DIRNAME = "ai-dev-platform"
 USER_CONFIG_FILENAME = "config.json"
@@ -210,6 +214,29 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--target", default=".", help="Repository path to inspect.")
     doctor.set_defaults(func=cmd_doctor)
 
+    codex_review = subparsers.add_parser(
+        "codex-review",
+        help="Inspect and guide GitHub/Codex PR review setup for a repository.",
+    )
+    codex_review.add_argument("--target", default=".", help="Repository path to inspect.")
+    codex_review.add_argument(
+        "--open-settings",
+        action="store_true",
+        help="Open the Codex code review settings page in the browser.",
+    )
+    codex_review.add_argument(
+        "--request-pr",
+        type=int,
+        default=None,
+        help="Post `@codex review` on the given PR if it has not already been requested.",
+    )
+    codex_review.add_argument(
+        "--force-comment",
+        action="store_true",
+        help="Post `@codex review` even if a fallback request comment already exists.",
+    )
+    codex_review.set_defaults(func=cmd_codex_review)
+
     upgrade = subparsers.add_parser(
         "upgrade", help="Sync platform-managed files and move the repo to a newer platform ref."
     )
@@ -388,6 +415,80 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     errors, warnings = inspect_target(target)
     report_issues(errors, warnings)
     return 1 if errors else 0
+
+
+def cmd_codex_review(args: argparse.Namespace) -> int:
+    target = Path(args.target).resolve()
+    if not (target / ".git").exists():
+        fail(f"{target} is not a Git repository.")
+
+    repo = infer_repo_full_name(target) or "<unknown>"
+    if args.open_settings:
+        webbrowser.open(CODEX_CODE_REVIEW_SETTINGS_URL)
+
+    if args.request_pr is not None:
+        request_codex_review_comment(
+            target=target,
+            pr_number=args.request_pr,
+            force=args.force_comment,
+        )
+
+    print(f"Repository: {repo}")
+    print("Codex review setup")
+    print(f"- settings: {CODEX_CODE_REVIEW_SETTINGS_URL}")
+    print(f"- docs: {OPENAI_CODEX_GITHUB_DOC_URL}")
+    print("- required UI step: in Codex settings, connect GitHub, enable Code review for this repository, and enable Automatic reviews if desired")
+    print("- terminal can verify/request reviews, but it cannot toggle the ChatGPT/Codex repository setting")
+
+    auth_warnings = check_local_auth("node-ts")
+    if auth_warnings:
+        print("Auth warnings:")
+        for warning in auth_warnings:
+            print(f"- {warning}")
+    else:
+        print("Auth: gh/Codex/Claude local login checks passed")
+
+    cloud_status = run_optional(["codex", "cloud", "list", "--json", "--limit", "1"], cwd=target)
+    if cloud_status and cloud_status.returncode == 0:
+        print("Codex cloud: reachable from CLI")
+    else:
+        print("Codex cloud: not verified; open Codex web and connect GitHub/repo access")
+
+    result = run_optional(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--state",
+            "all",
+            "--limit",
+            "5",
+            "--json",
+            "number,url,reviews,comments,reviewDecision",
+        ],
+        cwd=target,
+    )
+    if not result or result.returncode != 0 or not result.stdout.strip():
+        print("PR review health: could not read PRs with gh")
+        return 0
+    try:
+        prs = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print("PR review health: could not parse gh PR output")
+        return 0
+
+    warnings = codex_review_health_from_prs(prs)
+    if warnings:
+        print("PR review health warnings:")
+        for warning in warnings:
+            print(f"- {warning}")
+    else:
+        print("PR review health: real Codex review artifact found in recent PRs")
+
+    if isinstance(prs, list) and prs:
+        latest = prs[0]
+        print(f"Latest PR: #{latest.get('number')} {latest.get('url')}")
+    return 0
 
 
 def cmd_upgrade(args: argparse.Namespace) -> int:
@@ -1335,6 +1436,10 @@ def check_codex_review_health(target: Path, manifest: dict[str, Any]) -> list[st
         prs = json.loads(result.stdout)
     except json.JSONDecodeError:
         return ["Could not parse recent PR data for Codex review health."]
+    return codex_review_health_from_prs(prs)
+
+
+def codex_review_health_from_prs(prs: Any) -> list[str]:
     if not isinstance(prs, list) or not prs:
         return ["No PR history found yet to validate automatic Codex reviews."]
     authors = {author.lower() for author in DEFAULT_CODEX_REVIEW_AUTHORS}
@@ -1353,12 +1458,41 @@ def check_codex_review_health(target: Path, manifest: dict[str, Any]) -> list[st
     if fallback_requested:
         return [
             "Recent PRs show `@codex review` fallback requests, but no real Codex review artifact. "
-            "Enable repo-level automatic Codex reviews or fix GitHub/Codex review access."
+            f"Enable repo-level Code review in Codex settings ({CODEX_CODE_REVIEW_SETTINGS_URL})."
         ]
     return [
         "Automatic Codex review is not verified: recent PRs do not show a real Codex review artifact. "
-        "Check the repository's GitHub/Codex review setting."
+        f"Run `platform codex-review --target <repo> --open-settings` and enable the repo in Codex settings ({CODEX_CODE_REVIEW_SETTINGS_URL})."
     ]
+
+
+def infer_repo_full_name(target: Path) -> str | None:
+    result = run_optional(
+        ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+        cwd=target,
+    )
+    if result and result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    remote = run_optional(["git", "remote", "get-url", "origin"], cwd=target)
+    if not remote or remote.returncode != 0:
+        return None
+    value = remote.stdout.strip()
+    match = re.search(r"github\.com[:/](?P<owner>[^/]+)/(?P<repo>[^/.]+)(?:\.git)?$", value)
+    if not match:
+        return None
+    return f"{match.group('owner')}/{match.group('repo')}"
+
+
+def request_codex_review_comment(*, target: Path, pr_number: int, force: bool) -> None:
+    existing = run_optional(
+        ["gh", "pr", "view", str(pr_number), "--json", "comments", "--jq", ".comments[].body"],
+        cwd=target,
+    )
+    if existing and existing.returncode == 0 and "@codex review" in existing.stdout.lower() and not force:
+        print(f"Skipped PR #{pr_number}: `@codex review` was already requested. Use --force-comment to post again.")
+        return
+    run_command(["gh", "pr", "comment", str(pr_number), "--body", "@codex review"], cwd=target)
+    print(f"Requested Codex review on PR #{pr_number}.")
 
 
 def check_orchestrator_registration(target: Path, manifest: dict[str, Any]) -> list[str]:
@@ -1389,7 +1523,8 @@ def check_orchestrator_registration(target: Path, manifest: dict[str, Any]) -> l
         )
     if not settings.public_base_url:
         warnings.append(
-            "Orchestrator public_base_url is not configured. Jira Automation callbacks need a fixed public URL."
+            "Orchestrator public_base_url is not configured. Jira Automation callbacks need a fixed public URL. "
+            "Run `platform orchestrator configure --public-base-url https://orchestrator.<domain>` on the worker host, then re-run `platform orchestrator register --target <repo>`."
         )
     if not project.get("webhook_secret"):
         warnings.append(

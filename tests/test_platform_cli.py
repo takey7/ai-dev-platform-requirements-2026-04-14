@@ -197,6 +197,19 @@ class PlatformCliTests(unittest.TestCase):
             platform.shutil.which = original_which
 
         self.assertTrue(any("fallback requests" in warning for warning in warnings))
+        self.assertTrue(any(platform.CODEX_CODE_REVIEW_SETTINGS_URL in warning for warning in warnings))
+
+    def test_codex_review_health_accepts_real_review(self) -> None:
+        warnings = platform.codex_review_health_from_prs(
+            [
+                {
+                    "reviews": [{"author": {"login": "codex[bot]"}}],
+                    "comments": [],
+                }
+            ]
+        )
+
+        self.assertEqual(warnings, [])
 
     def test_orchestrator_registration_missing_warns(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

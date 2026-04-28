@@ -92,7 +92,7 @@ Before considering work done, run:
 3. unit tests
 4. integration tests where relevant
 
-## Notes for GitHub review
+## Review guidelines
 - Focus on changed files only
 - For docs-only PRs, treat typos as P2 unless explicitly configured otherwise
 - For API/schema/auth/infra changes, prioritize hidden breakage and rollback risk

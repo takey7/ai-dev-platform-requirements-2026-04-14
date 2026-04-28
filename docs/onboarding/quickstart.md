@@ -65,6 +65,16 @@ cd ai-dev-platform-requirements-2026-04-14
 ```
 
 ## 7. Register the resident orchestrator
+
+Permanent Jira callbacks require a fixed public worker URL. Configure it before registering live Automation rules:
+
+```bash
+./bin/platform orchestrator configure \
+  --public-base-url https://orchestrator.<domain> \
+  --bind-host 127.0.0.1 \
+  --bind-port 8787
+```
+
 ```bash
 ./bin/platform orchestrator register --target /path/to/consumer-repo
 ```
@@ -93,6 +103,8 @@ If the worker is not running and a job is waiting on GitHub, refresh state manua
 ```
 
 For a guided first run, use [first-project-walkthrough.md](first-project-walkthrough.md).
+
+For Codex GitHub review setup, use [codex-github-review.md](codex-github-review.md).
 
 ## 9. Start day-to-day flow
 ```bash

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import http.client
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -53,6 +55,30 @@ class PlatformOrchestratorTests(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    def test_configure_saves_public_base_url_and_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "orchestrator.json"
+            project_root = Path(tmpdir) / "projects"
+            args = SimpleNamespace(
+                config=str(config_path),
+                bind_host="127.0.0.1",
+                bind_port=8788,
+                public_base_url="orchestrator.example.com",
+                clear_public_base_url=False,
+                project_root=[str(project_root)],
+                jira_site_url="ssbot.atlassian.net",
+                jira_admin_email="admin@example.com",
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                orchestrator.cmd_configure(args)
+
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["bind_port"], 8788)
+            self.assertEqual(payload["public_base_url"], "https://orchestrator.example.com")
+            self.assertIn(str(project_root.resolve()), payload["projects_roots"])
+            self.assertEqual(payload["jira_site_url"], "https://ssbot.atlassian.net")
 
     def test_issue_is_auto_ready(self) -> None:
         issue = {
