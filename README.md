@@ -118,15 +118,6 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
 ```
 
 ### 8. Jira 駆動の常駐オーケストレータを登録する
-恒久運用では、先に固定公開 URL を worker config に保存します。
-
-```bash
-./bin/platform orchestrator configure \
-  --public-base-url https://orchestrator.<domain> \
-  --bind-host 127.0.0.1 \
-  --bind-port 8787
-```
-
 ```bash
 ./bin/platform orchestrator register \
   --target /path/to/consumer-repo
@@ -137,22 +128,21 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
 - worker config を `~/.config/ai-dev-platform/orchestrator.json` に作る
 - `projects_roots[]` に repo の親ディレクトリを追加する
 - Jira control issue を作るか再利用する
-- 可能なら project-scoped Automation rule を 2 本作る
-  - lifecycle -> `POST /jira/events/<PROJECT_KEY>`
-  - comment control -> `POST /jira/events/<PROJECT_KEY>`
-- project ごとに別の webhook secret を払い出す
-- live rule 作成ができない場合でも、`.platform/orchestrator/automation-rules/` に rule payload blueprint を出力する
+- 既定は polling mode なので Jira Automation / public callback URL は不要
+- 旧 webhook mode から戻す場合、DB に残っている Automation rule は可能な範囲で disabled にする
+- webhook mode が必要な場合だけ `--webhook --public-base-url https://orchestrator.<domain>` を使う
 
 ### 9. 常駐 worker を起動する
 ```bash
-./bin/platform orchestrator run
+./bin/platform orchestrator run --poll-only
 ```
 
 - worker は single-process + SQLite WAL で state を保持する
 - repo ごとに 1 issue だけ lease を取る
 - `ai:auto` + ready status (`To Do`, `Selected for Development`) の issue を対象にする
+- Jira comments を polling し、`/ai pause`, `/ai resume`, `/ai cancel`, `/ai retry`, `/ai status` を処理する
 - `ready_for_merge` で停止し、merge は人か既存 GitHub ルールに委ねる
-- 恒久運用では `deploy/orchestrator/` の `systemd` unit と `Caddyfile` を使い、固定 URL で公開する
+- public HTTPS URL が必要なのは webhook mode を明示した場合だけ
 
 ### 10. GitHub/Codex review を確認する
 ```bash
@@ -268,9 +258,9 @@ base 層は stack-neutral を維持し、Node 前提の実装は `scaffolds/adap
 - 人間と Claude/Codex の通常開発では、引き続き repo-scoped MCP + OAuth を標準にする
 - resident orchestrator は Jira event / control / sticky comment のために Jira REST を使う
 - `Claude` と `Codex` は直接会話させず、worker が structured payload で baton pass する
-- Jira の主経路は project-scoped Automation rule + `Send web request`
-- `jira:issue_updated` に comment が載らないため、comment control は別 rule に分ける
-- 固定 URL の単一 Worker で複数 project を同居させるが、event endpoint と webhook secret は project 単位で分離する
+- Jira の主経路は polling-first。worker が repo manifest の Jira project key ごとに Jira REST を polling する
+- webhook mode は optional。project-scoped Automation rule + `Send web request` は低遅延が必要な場合だけ使う
+- 固定 URL は webhook mode のみ必要。polling mode は outbound Jira REST だけで動く
 - GitHub 連携の inbound は webhook ではなく polling に固定する
 - v1 の自動化は `PR まで自動`
 
@@ -300,7 +290,7 @@ base 層は stack-neutral を維持し、Node 前提の実装は `scaffolds/adap
 - [導入 quickstart](docs/onboarding/quickstart.md)
 - [初回プロジェクト walkthrough](docs/onboarding/first-project-walkthrough.md)
 - [GitHub / 配布方針](docs/onboarding/distribution.md)
-- [固定 URL worker host](docs/onboarding/orchestrator-host.md)
+- [worker host](docs/onboarding/orchestrator-host.md)
 - [新規 project から起動までの manual](docs/onboarding/new-project-to-startup-manual.md)
 - [意思決定サマリ](docs/00_decision_summary.md)
 - [要件定義](docs/02_requirements_definition.md)

@@ -92,15 +92,10 @@ security add-generic-password \
 
 ## 5. Worker に登録する
 
-固定 URL worker を使う場合:
-
 ```bash
 ./bin/platform orchestrator register \
-  --target ~/workspaces/learning-ai-flow-<YYYYMMDD> \
-  --public-base-url https://orchestrator.<domain>
+  --target ~/workspaces/learning-ai-flow-<YYYYMMDD>
 ```
-
-ローカル検証だけの場合は、一時公開 URL を使って同じ `--public-base-url` に指定します。
 
 登録後に doctor で operational warning を確認します。
 
@@ -113,14 +108,10 @@ security add-generic-password \
 固定 host では systemd が起動します。手元で確認する場合:
 
 ```bash
-./bin/platform orchestrator run
+./bin/platform orchestrator run --poll-only
 ```
 
-別 terminal で health check:
-
-```bash
-curl https://orchestrator.<domain>/healthz
-```
+別 terminal で `platform orchestrator status --project <PROJECT_KEY>` を確認します。
 
 ## 7. Jira issue を作る
 
@@ -145,7 +136,7 @@ summary は "Add queue health endpoint"。
 
 Jira issue に `ai:auto` label を付け、status を `To Do` または `Selected for Development` にします。
 
-worker が event を受けると、次を進めます。
+worker が polling で issue/comment を拾うと、次を進めます。
 
 - spec 生成
 - branch / worktree 作成

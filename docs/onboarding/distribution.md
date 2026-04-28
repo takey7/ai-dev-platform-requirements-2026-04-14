@@ -38,23 +38,23 @@
   - REST + API token
   - used only by `create-project` to create a Jira Software Kanban project
 - Resident orchestrator plane:
-  - Jira Automation `Send web request` + worker HTTP ingress + Jira REST/GitHub polling
+  - polling-first Jira REST + GitHub polling
   - used by `platform orchestrator run`
   - consumes repo-local manifests but keeps its SQLite state outside tracked repos
-  - uses a single public worker host with project-specific endpoints and webhook secrets
+  - uses repo project keys to keep multiple projects isolated
 - Generated repos must not store Jira admin credentials
 - The worker config lives in `~/.config/ai-dev-platform/orchestrator.json`
 - The worker DB lives in `~/.local/state/ai-dev-platform/orchestrator/orchestrator.db`
 
 ## Orchestrator rollout checklist
 - register each consuming repo with `platform orchestrator register --target <repo>`
-- keep the worker `public_base_url` reachable from Atlassian Automation allowlists
-- expose `GET /healthz` plus `POST /jira/events/<PROJECT_KEY>` and validate the matching project secret on each callback
+- run `platform orchestrator run --poll-only`
 - run the worker under a dedicated account already logged into `gh`, `claude`, and `codex`
 - use Jira label `ai:auto` as the start gate and comment commands for pause/resume/cancel/status
 - treat `ready_for_merge` as the worker stop state in v1; do not auto-merge by default
 - enable automatic Codex review on each repo; the worker only falls back to `@codex review` if no real review artifact arrives
 - use `platform orchestrator poll` or `status --refresh` when the worker was stopped and GitHub check/review state needs to be reconciled manually
+- use webhook mode only when low-latency Jira events are worth maintaining a public callback URL
 
 ## GitHub publish checklist
 - push the source repo

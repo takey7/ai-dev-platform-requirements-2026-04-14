@@ -1,3 +1,5 @@
+# Optional webhook-mode reverse proxy.
+# Polling mode does not require Caddy or any public URL.
 orchestrator.example.com {
   encode gzip zstd
 

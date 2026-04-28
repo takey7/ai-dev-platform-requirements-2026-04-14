@@ -34,6 +34,7 @@ DEFAULT_POLL_INTERVALS = {
 }
 DEFAULT_BIND_HOST = "127.0.0.1"
 DEFAULT_BIND_PORT = 8787
+DEFAULT_EVENT_MODE = "polling"
 DEFAULT_GITHUB_MODE = "polling"
 DEFAULT_HEADER_NAME = "X-Platform-Orchestrator-Secret"
 LEGACY_HEADER_NAME = "X-Platform-Shared-Secret"
@@ -98,6 +99,7 @@ class WorkerSettings:
     db_path: Path
     bind_host: str
     bind_port: int
+    event_mode: str
     public_base_url: str
     projects_roots: tuple[Path, ...]
     poll_intervals: dict[str, int]
@@ -141,11 +143,17 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
 
     configure = orchestrator_subparsers.add_parser(
         "configure",
-        help="Update resident worker host settings such as the fixed public callback URL.",
+        help="Update resident worker settings such as polling roots or optional webhook URL.",
     )
     configure.add_argument("--config", default=None, help="Override the worker config path.")
     configure.add_argument("--bind-host", default=None, help="HTTP bind host for the worker.")
     configure.add_argument("--bind-port", type=int, default=None, help="HTTP bind port for the worker.")
+    configure.add_argument(
+        "--event-mode",
+        choices=["polling", "webhook"],
+        default=None,
+        help="Jira intake mode. Default is polling; webhook requires a fixed public URL.",
+    )
     configure.add_argument(
         "--public-base-url",
         default=None,
@@ -168,11 +176,22 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
 
     run = orchestrator_subparsers.add_parser(
         "run",
-        help="Run the resident worker that consumes Jira events and drives Claude/Codex/GitHub.",
+        help="Run the resident worker that polls Jira/GitHub and drives Claude/Codex.",
     )
     run.add_argument("--config", default=None, help="Override the worker config path.")
     run.add_argument("--bind-host", default=None, help="Override the HTTP bind host.")
     run.add_argument("--bind-port", type=int, default=None, help="Override the HTTP bind port.")
+    run.add_argument(
+        "--event-mode",
+        choices=["polling", "webhook"],
+        default=None,
+        help="Override Jira intake mode for this run.",
+    )
+    run.add_argument(
+        "--poll-only",
+        action="store_true",
+        help="Run in polling mode and do not start the webhook HTTP listener.",
+    )
     run.add_argument(
         "--public-base-url",
         default=None,
@@ -205,12 +224,23 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
 
     register = orchestrator_subparsers.add_parser(
         "register",
-        help="Register a repo for orchestration, create a control issue, and set up Jira delivery hooks.",
+        help="Register a repo for orchestration and create or reuse its Jira control issue.",
     )
     register.add_argument("--target", required=True, help="Repository path to register.")
     register.add_argument("--config", default=None, help="Override the worker config path.")
     register.add_argument("--bind-host", default=None, help="Override the HTTP bind host.")
     register.add_argument("--bind-port", type=int, default=None, help="Override the HTTP bind port.")
+    register.add_argument(
+        "--event-mode",
+        choices=["polling", "webhook"],
+        default=None,
+        help="Override Jira intake mode for registration.",
+    )
+    register.add_argument(
+        "--webhook",
+        action="store_true",
+        help="Opt in to Jira Automation webhook rule creation for this repo.",
+    )
     register.add_argument(
         "--public-base-url",
         default=None,
@@ -297,6 +327,8 @@ def cmd_configure(args: argparse.Namespace) -> int:
         config["bind_host"] = args.bind_host
     if args.bind_port is not None:
         config["bind_port"] = args.bind_port
+    if args.event_mode is not None:
+        config["event_mode"] = args.event_mode
     if args.clear_public_base_url:
         config["public_base_url"] = ""
     if args.public_base_url is not None:
@@ -315,10 +347,10 @@ def cmd_configure(args: argparse.Namespace) -> int:
     save_orchestrator_config(config, config_path)
     print(f"Saved orchestrator config: {config_path}")
     print(json.dumps(config, indent=2, ensure_ascii=False))
-    if config.get("public_base_url"):
+    if config.get("event_mode") == "webhook" and config.get("public_base_url"):
         print("Re-run `platform orchestrator register --target <repo>` for each project to update Jira Automation callbacks.")
     else:
-        print("Live Jira Automation callback setup is disabled until public_base_url is set.")
+        print("Polling mode is active. No public URL or Jira Automation callback is required.")
     return 0
 
 
@@ -327,6 +359,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         config_override=args.config,
         bind_host=args.bind_host,
         bind_port=args.bind_port,
+        event_mode="polling" if args.poll_only else args.event_mode,
         public_base_url=args.public_base_url,
         listen_url=args.listen_url,
         project_roots=args.project_root,
@@ -336,7 +369,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     require_runtime_credentials(settings)
     store = OrchestratorStore(settings.db_path)
     service = OrchestratorService(settings=settings, store=store)
-    service.run(once=args.once, enable_http=not args.no_http)
+    service.run(once=args.once, enable_http=(not args.no_http and settings.event_mode == "webhook"))
     return 0
 
 
@@ -347,6 +380,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         config_override=args.config,
         bind_host=args.bind_host,
         bind_port=args.bind_port,
+        event_mode="webhook" if args.webhook else args.event_mode,
         public_base_url=args.public_base_url,
         listen_url=args.listen_url,
         project_roots=[str(project.repo_path.parent)],
@@ -359,22 +393,28 @@ def cmd_register(args: argparse.Namespace) -> int:
             f"{existing['repo_path']}."
         )
     store.sync_projects([project])
-    webhook_secret = store.ensure_project_webhook_secret(
-        project.project_key,
-        args.webhook_secret or args.shared_secret,
-    )
-
-    project_id = ""
-    control_issue_key = ""
-    lifecycle_rule_uuid = ""
-    comment_rule_uuid = ""
+    current_registration = store.project(project.project_key) or {}
+    project_id = str(current_registration.get("jira_project_id", ""))
+    control_issue_key = str(current_registration.get("control_issue_key", ""))
+    lifecycle_rule_uuid = str(current_registration.get("lifecycle_rule_uuid", ""))
+    comment_rule_uuid = str(current_registration.get("comment_rule_uuid", ""))
+    previous_rule_uuids = [rule for rule in (lifecycle_rule_uuid, comment_rule_uuid) if rule]
+    webhook_secret = str(current_registration.get("webhook_secret", ""))
+    provided_secret = args.webhook_secret or args.shared_secret
+    disabled_legacy_rules: list[str] = []
+    if settings.event_mode == "webhook":
+        webhook_secret = store.ensure_project_webhook_secret(
+            project.project_key,
+            provided_secret,
+        )
+    else:
+        webhook_secret = ""
+        lifecycle_rule_uuid = ""
+        comment_rule_uuid = ""
     api_token = atlassian_api_token()
-    if (
-        settings.public_base_url
-        and settings.jira_site_url
-        and settings.jira_admin_email
-        and api_token
-    ):
+    if settings.jira_site_url and settings.jira_admin_email and api_token:
+        if settings.event_mode != "webhook":
+            disabled_legacy_rules = disable_automation_rules(settings, previous_rule_uuids)
         project_details = jira_get_project(
             site_url=settings.jira_site_url,
             admin_email=settings.jira_admin_email,
@@ -383,10 +423,14 @@ def cmd_register(args: argparse.Namespace) -> int:
         )
         project_id = str(project_details.get("id", ""))
         control_issue_key = ensure_control_issue(settings, project)
-        rule_result = ensure_automation_rules(settings, project, project_id, webhook_secret)
-        lifecycle_rule_uuid = rule_result.get("lifecycle_rule_uuid", "")
-        comment_rule_uuid = rule_result.get("comment_rule_uuid", "")
-    else:
+        if settings.event_mode == "webhook":
+            if settings.public_base_url:
+                rule_result = ensure_automation_rules(settings, project, project_id, webhook_secret)
+                lifecycle_rule_uuid = rule_result.get("lifecycle_rule_uuid", "")
+                comment_rule_uuid = rule_result.get("comment_rule_uuid", "")
+            else:
+                export_automation_rule_blueprints(settings, project)
+    elif settings.event_mode == "webhook":
         export_automation_rule_blueprints(settings, project)
 
     store.update_project_registration(
@@ -402,17 +446,22 @@ def cmd_register(args: argparse.Namespace) -> int:
     print(f"- project key: {project.project_key}")
     print(f"- config: {settings.config_path}")
     print(f"- db: {settings.db_path}")
-    if settings.public_base_url:
+    print(f"- event mode: {settings.event_mode}")
+    if settings.event_mode == "webhook" and settings.public_base_url:
         print(f"- endpoint: {settings.public_base_url}/jira/events/{project.project_key}")
     else:
-        print("- endpoint: set public_base_url to enable live callbacks")
+        print("- endpoint: polling mode uses outbound Jira REST; no callback URL required")
     if control_issue_key:
         print(f"- control issue: {control_issue_key}")
     if lifecycle_rule_uuid or comment_rule_uuid:
         print(f"- lifecycle rule: {lifecycle_rule_uuid or 'skipped'}")
         print(f"- comment rule: {comment_rule_uuid or 'skipped'}")
-    else:
+    elif settings.event_mode == "webhook":
         print("- automation rules: exported as blueprints (live API setup skipped)")
+    else:
+        print("- automation rules: skipped (polling mode)")
+        if disabled_legacy_rules:
+            print(f"- disabled legacy automation rules: {len(disabled_legacy_rules)}")
     return 0
 
 
@@ -695,12 +744,56 @@ class OrchestratorService:
         for current_key, project in projects.items():
             if project_key and current_key != project_key:
                 continue
+            count += self.poll_jira_control_comments(current_key)
             if self.store.control_flag_value("project", current_key, "pause") == "paused":
                 continue
             for issue in jira_search_auto_issues(self.settings, current_key):
+                count += self.poll_jira_control_comments(current_key, issue_keys=[str(issue["key"])])
                 if self.maybe_enqueue_issue(current_key, issue["key"]):
                     count += 1
         return count
+
+    def poll_jira_control_comments(self, project_key: str, issue_keys: list[str] | None = None) -> int:
+        project = self.store.project(project_key)
+        if not project:
+            return 0
+        candidates = {normalize_issue_key(key) for key in (issue_keys or [])}
+        control_issue_key = self.store.project_control_issue(project_key)
+        if control_issue_key:
+            candidates.add(control_issue_key)
+        for job in self.store.list_jobs(project_key=project_key):
+            candidates.add(str(job["issue_key"]))
+
+        processed = 0
+        for issue_key in sorted(key for key in candidates if key):
+            for comment in jira_issue_comments(self.settings, issue_key):
+                comment_id = str(comment.get("id", ""))
+                if not comment_id or self.store.has_processed_comment(comment_id):
+                    continue
+                body = extract_jira_text(comment.get("body"))
+                command = parse_control_command(body)
+                if command:
+                    self.store.append_event(
+                        project_key,
+                        issue_key,
+                        "comment_control",
+                        {
+                            "event_type": "comment_control",
+                            "project_key": project_key,
+                            "issue_key": issue_key,
+                            "comment_id": comment_id,
+                            "command": body,
+                        },
+                    )
+                    self.handle_comment_control(project_key, issue_key, {"command": body})
+                    processed += 1
+                self.store.mark_processed_comment(
+                    comment_id=comment_id,
+                    project_key=project_key,
+                    issue_key=issue_key,
+                    command=command,
+                )
+        return processed
 
     def maybe_enqueue_issue(self, project_key: str, issue_key: str) -> bool:
         project = self.store.project(project_key)
@@ -709,6 +802,7 @@ class OrchestratorService:
         issue = jira_get_issue(self.settings, issue_key)
         if not issue_is_auto_ready(issue):
             return False
+        existing_job = self.store.get_job(issue_key)
         self.store.enqueue_issue(
             project_key=project_key,
             repo_path=project["repo_path"],
@@ -716,7 +810,7 @@ class OrchestratorService:
             status=str(issue["fields"]["status"]["name"]),
             summary=str(issue["fields"].get("summary", "")),
         )
-        return True
+        return not existing_job
 
     def dispatch_jobs(self) -> None:
         if self.store.control_flag_value("global", "*", "pause") == "paused":
@@ -1153,6 +1247,13 @@ class OrchestratorStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (scope_type, scope_key, flag)
                 );
+                CREATE TABLE IF NOT EXISTS processed_comments (
+                    comment_id TEXT PRIMARY KEY,
+                    project_key TEXT NOT NULL,
+                    issue_key TEXT NOT NULL,
+                    command TEXT DEFAULT '',
+                    processed_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_column(
@@ -1298,9 +1399,7 @@ class OrchestratorStore:
         summary: str,
     ) -> None:
         existing = self.get_job(issue_key)
-        if existing and existing["state"] in TERMINAL_STATES:
-            return
-        if existing and existing["state"] not in {"failed", "blocked", "paused"}:
+        if existing:
             with self._connection() as connection:
                 connection.execute(
                     """
@@ -1317,16 +1416,6 @@ class OrchestratorStore:
                 INSERT INTO jobs (
                     issue_key, project_key, repo_path, state, status_name, summary, created_at, updated_at
                 ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)
-                ON CONFLICT(issue_key) DO UPDATE SET
-                    project_key=excluded.project_key,
-                    repo_path=excluded.repo_path,
-                    status_name=excluded.status_name,
-                    summary=excluded.summary,
-                    state=CASE
-                        WHEN jobs.state IN ('ready_for_merge', 'done', 'cancelled') THEN jobs.state
-                        ELSE 'queued'
-                    END,
-                    updated_at=excluded.updated_at
                 """,
                 (issue_key, project_key, repo_path, status, summary, now_iso(), now_iso()),
             )
@@ -1539,12 +1628,39 @@ class OrchestratorStore:
     def clear_requested_action(self, issue_key: str) -> None:
         self.update_job(issue_key, requested_action="")
 
+    def has_processed_comment(self, comment_id: str) -> bool:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT comment_id FROM processed_comments WHERE comment_id = ?",
+                (comment_id,),
+            ).fetchone()
+            return bool(row)
+
+    def mark_processed_comment(
+        self,
+        *,
+        comment_id: str,
+        project_key: str,
+        issue_key: str,
+        command: str,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO processed_comments (comment_id, project_key, issue_key, command, processed_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(comment_id) DO NOTHING
+                """,
+                (comment_id, project_key, issue_key, command, now_iso()),
+            )
+
 
 def load_worker_settings(
     *,
     config_override: str | None = None,
     bind_host: str | None = None,
     bind_port: int | None = None,
+    event_mode: str | None = None,
     public_base_url: str | None = None,
     listen_url: str | None = None,
     project_roots: list[str] | None = None,
@@ -1561,6 +1677,8 @@ def load_worker_settings(
         config["bind_host"] = bind_host
     if bind_port is not None:
         config["bind_port"] = int(bind_port)
+    if event_mode is not None:
+        config["event_mode"] = event_mode
     if public_base_url is not None:
         config["public_base_url"] = normalize_public_base_url(public_base_url)
     if listen_url:
@@ -1584,6 +1702,7 @@ def load_worker_settings(
         db_path=state_dir / DB_FILENAME,
         bind_host=str(config["bind_host"]),
         bind_port=int(config["bind_port"]),
+        event_mode=str(config.get("event_mode", DEFAULT_EVENT_MODE)),
         public_base_url=str(config.get("public_base_url", "")).rstrip("/"),
         projects_roots=tuple(Path(item).expanduser().resolve() for item in config["projects_roots"]),
         poll_intervals={key: int(value) for key, value in config["poll_intervals"].items()},
@@ -1640,6 +1759,9 @@ def load_orchestrator_config(config_path: Path | None = None) -> dict[str, Any]:
     config.pop("shared_secret", None)
     config["bind_host"] = str(config.get("bind_host") or DEFAULT_BIND_HOST)
     config["bind_port"] = int(config.get("bind_port") or DEFAULT_BIND_PORT)
+    config["event_mode"] = str(config.get("event_mode") or DEFAULT_EVENT_MODE)
+    if config["event_mode"] not in {"polling", "webhook"}:
+        config["event_mode"] = DEFAULT_EVENT_MODE
     config["public_base_url"] = normalize_public_base_url(str(config.get("public_base_url", "")))
     config["projects_roots"] = [
         str(Path(item).expanduser().resolve())
@@ -1663,6 +1785,7 @@ def default_orchestrator_config() -> dict[str, Any]:
         "version": 2,
         "bind_host": DEFAULT_BIND_HOST,
         "bind_port": DEFAULT_BIND_PORT,
+        "event_mode": DEFAULT_EVENT_MODE,
         "public_base_url": "",
         "projects_roots": [default_projects_root()],
         "poll_intervals": dict(DEFAULT_POLL_INTERVALS),
@@ -1842,6 +1965,17 @@ def jira_get_issue(settings: WorkerSettings, issue_key: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise OrchestratorError(f"Could not fetch Jira issue {issue_key}")
     return payload
+
+
+def jira_issue_comments(settings: WorkerSettings, issue_key: str) -> list[dict[str, Any]]:
+    payload = jira_request(
+        settings=settings,
+        method="GET",
+        path=f"/rest/api/3/issue/{issue_key}/comment?"
+        + parse.urlencode({"orderBy": "created", "maxResults": 100}),
+    )
+    comments = payload.get("comments", []) if isinstance(payload, dict) else []
+    return [comment for comment in comments if isinstance(comment, dict)]
 
 
 def jira_get_project(
@@ -2073,6 +2207,33 @@ def ensure_automation_rules(
         ),
     )
     return {"lifecycle_rule_uuid": lifecycle_uuid, "comment_rule_uuid": comment_uuid}
+
+
+def disable_automation_rules(settings: WorkerSettings, rule_uuids: list[str]) -> list[str]:
+    disabled: list[str] = []
+    for rule_uuid in dict.fromkeys(rule_uuids):
+        if not rule_uuid:
+            continue
+        try:
+            payload = automation_request(
+                settings,
+                method="GET",
+                path=f"/rule/{rule_uuid}?redactSensitiveFields=true",
+            )
+            rule = payload.get("rule", {}) if isinstance(payload, dict) else {}
+            if not rule or rule.get("state") == "DISABLED":
+                continue
+            rule["state"] = "DISABLED"
+            automation_request(
+                settings,
+                method="PUT",
+                path=f"/rule/{rule_uuid}",
+                payload={"rule": rule, "connections": payload.get("connections", [])},
+            )
+            disabled.append(rule_uuid)
+        except OrchestratorError as exc:
+            print(f"warning: could not disable legacy Automation rule {rule_uuid}: {exc}", file=sys.stderr)
+    return disabled
 
 
 def ensure_automation_rule(

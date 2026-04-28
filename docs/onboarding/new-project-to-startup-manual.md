@@ -7,7 +7,7 @@
 - formal entrypoint: `./bin/platform`
 - Jira 既定テンプレート: `Kanban`
 - Claude / Codex は login-based auth
-- Jira project 作成や Automation rule 登録だけ Jira admin token を使う
+- Jira project 作成と control issue 作成だけ Jira admin token を使う
 
 ## 1. ローカル認証
 ```bash
@@ -75,13 +75,10 @@ tmux list-sessions
 cat ~/workspaces/<repo-name>/.platform/platform.yaml
 ```
 
-## 4. 固定 URL worker host を用意する
-恒久運用では Linux VM + Caddy + systemd を使います。詳細は [orchestrator-host.md](orchestrator-host.md) を参照してください。
+## 4. worker を用意する
+既定は polling-first です。ローカル Mac から Jira REST / GitHub CLI へ outbound 接続するだけなので、public HTTPS URL は不要です。
 
-テスト時の最小要件:
-- public HTTPS URL がある
-- worker は `127.0.0.1:<port>` で bind
-- public URL は `public_base_url` と一致
+常時稼働させたい場合だけ Linux VM + systemd を使います。詳細は [orchestrator-host.md](orchestrator-host.md) を参照してください。
 
 worker config の確認:
 ```bash
@@ -89,9 +86,9 @@ cat ~/.config/ai-dev-platform/orchestrator.json
 ```
 
 最低限必要な項目:
+- `event_mode`: 既定は `polling`
 - `bind_host`
 - `bind_port`
-- `public_base_url`
 - `projects_roots`
 - `jira_site_url`
 - `jira_admin_email`
@@ -99,34 +96,38 @@ cat ~/.config/ai-dev-platform/orchestrator.json
 ## 5. consuming repo を worker に登録する
 ```bash
 ./bin/platform orchestrator register \
-  --target ~/workspaces/<repo-name> \
-  --public-base-url https://orchestrator.<domain>
+  --target ~/workspaces/<repo-name>
 ```
 
 このコマンドで行われること:
 - `projects_roots[]` に repo 親ディレクトリを追加
 - Jira control issue を作成または再利用
-- project 固有 endpoint を作る
-  - `POST /jira/events/<PROJECT_KEY>`
-- project ごとの webhook secret を払い出す
-- Jira Automation rule を 2 本作成または更新
-  - `<PROJECT_KEY> / AI lifecycle`
-  - `<PROJECT_KEY> / AI comments`
+- worker DB に repo と Jira project key を登録
+- polling mode では Jira Automation rule は作らない
+- 旧 webhook mode の rule ID が DB に残っている場合は、可能な範囲で Jira 側 rule を disabled にする
+
+webhook mode が必要な場合だけ、明示的に opt-in します。
+
+```bash
+./bin/platform orchestrator register \
+  --target ~/workspaces/<repo-name> \
+  --webhook \
+  --public-base-url https://orchestrator.<domain>
+```
 
 複数 project を同じ worker に載せる場合も同じです。
 ```bash
-./bin/platform orchestrator register --target ~/workspaces/repo-a --public-base-url https://orchestrator.<domain>
-./bin/platform orchestrator register --target ~/workspaces/repo-b --public-base-url https://orchestrator.<domain>
+./bin/platform orchestrator register --target ~/workspaces/repo-a
+./bin/platform orchestrator register --target ~/workspaces/repo-b
 ```
 
 ## 6. worker を起動する
 ```bash
-./bin/platform orchestrator run
+./bin/platform orchestrator run --poll-only
 ```
 
 別ターミナルで確認:
 ```bash
-curl https://orchestrator.<domain>/healthz
 ./bin/platform orchestrator status --project <PROJECT_KEY>
 ```
 
@@ -212,18 +213,17 @@ worker が止まっていた場合は、GitHub 状態を手動で再取得しま
 
 ## 11. 複数 project で混ざらないことの確認
 以下を project ごとに確認します。
-- Jira endpoint が `/jira/events/<PROJECT_KEY>` になっている
-- webhook secret が project ごとに違う
+- `.platform/platform.yaml` の `issue.project_key` が repo ごとに一意
 - branch 名がその issue key を含む
 - worktree path が `.../worktrees/<PROJECT_KEY>/.../<ISSUE_KEY>` になっている
 - sticky comment の branch / PR URL がその repo だけを指す
 - 他 repo の PR や Jira issue key が混ざらない
 
 ## 12. 失敗時の切り分け
-- healthz が落ちる:
-  - worker bind / reverse proxy / public URL を確認
-- Jira event が来ない:
-  - Automation rule の URL / secret / project scope を確認
+- Jira issue が拾われない:
+  - issue に `ai:auto` label があるか確認
+  - status が `To Do` または `Selected for Development` か確認
+  - `platform orchestrator reconcile --project <PROJECT_KEY>` を実行
 - Jira issue は読めるが PR が出ない:
   - `platform orchestrator status`
   - worktree の `git status`

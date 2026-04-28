@@ -66,35 +66,29 @@ cd ai-dev-platform-requirements-2026-04-14
 
 ## 7. Register the resident orchestrator
 
-Permanent Jira callbacks require a fixed public worker URL. Configure it before registering live Automation rules:
-
-```bash
-./bin/platform orchestrator configure \
-  --public-base-url https://orchestrator.<domain> \
-  --bind-host 127.0.0.1 \
-  --bind-port 8787
-```
-
 ```bash
 ./bin/platform orchestrator register --target /path/to/consumer-repo
 ```
 
-This updates `~/.config/ai-dev-platform/orchestrator.json`, creates or reuses the Jira control issue, and attempts to create two project-scoped Automation rules:
-- lifecycle -> `POST /jira/events/<PROJECT_KEY>`
-- comment control -> `POST /jira/events/<PROJECT_KEY>`
+This updates `~/.config/ai-dev-platform/orchestrator.json`, creates or reuses the Jira control issue, and registers the repo for polling-first orchestration.
 
-Each registered project gets its own webhook secret. Re-registering one project must not rotate secrets or break other projects.
+Webhook mode is optional. Only use it when you intentionally want Jira Automation callbacks:
 
-If live rule creation is not available, the rule payload blueprints are written to `.platform/orchestrator/automation-rules/`.
+```bash
+./bin/platform orchestrator register \
+  --target /path/to/consumer-repo \
+  --webhook \
+  --public-base-url https://orchestrator.<domain>
+```
 
 ## 8. Run the worker
 ```bash
-./bin/platform orchestrator run
+./bin/platform orchestrator run --poll-only
 ```
 
-The worker keeps a SQLite WAL state DB under `~/.local/state/ai-dev-platform/orchestrator/`, mirrors progress to Jira, and stops at `ready_for_merge`.
+The worker keeps a SQLite WAL state DB under `~/.local/state/ai-dev-platform/orchestrator/`, polls Jira issues/comments and GitHub checks/reviews, mirrors progress to Jira, and stops at `ready_for_merge`.
 
-For permanent hosting, use the fixed-URL host layout in [orchestrator-host.md](orchestrator-host.md).
+For always-on hosting, use the worker host layout in [orchestrator-host.md](orchestrator-host.md). A public URL is required only for optional webhook mode.
 
 If the worker is not running and a job is waiting on GitHub, refresh state manually:
 ```bash

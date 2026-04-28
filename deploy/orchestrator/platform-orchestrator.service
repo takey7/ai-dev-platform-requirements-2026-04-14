@@ -10,7 +10,7 @@ Group=platform-orchestrator
 WorkingDirectory=/opt/ai-dev-platform-source
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=-/etc/platform-orchestrator.env
-ExecStart=/opt/ai-dev-platform-source/bin/platform orchestrator run
+ExecStart=/opt/ai-dev-platform-source/bin/platform orchestrator run --poll-only
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

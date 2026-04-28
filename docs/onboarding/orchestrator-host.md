@@ -3,9 +3,8 @@
 ## Target shape
 - one Linux VM
 - one dedicated OS user: `platform-orchestrator`
-- one public HTTPS endpoint: `https://orchestrator.<domain>`
 - one resident worker process
-- one reverse proxy in front of the worker
+- optional public HTTPS endpoint only if webhook mode is enabled
 
 ## Required runtime on the host
 - `gh`
@@ -44,17 +43,15 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now platform-orchestrator
 ```
 
-## Caddy
-1. Copy `deploy/orchestrator/Caddyfile` into your Caddy config.
-2. Replace `orchestrator.example.com` with the real public hostname.
-3. Point the reverse proxy to the worker bind address from `orchestrator.json`.
+## Optional Caddy
+Polling mode does not need a reverse proxy or public URL. Use Caddy only if you opt in to webhook mode.
 
 ## Recommended worker config
-Use the CLI to write the durable callback URL:
+Use the CLI to keep polling mode explicit:
 
 ```bash
 ./bin/platform orchestrator configure \
-  --public-base-url https://orchestrator.<domain> \
+  --event-mode polling \
   --bind-host 127.0.0.1 \
   --bind-port 8787
 ```
@@ -64,7 +61,8 @@ Use the CLI to write the durable callback URL:
   "version": 2,
   "bind_host": "127.0.0.1",
   "bind_port": 8787,
-  "public_base_url": "https://orchestrator.example.com",
+  "event_mode": "polling",
+  "public_base_url": "",
   "projects_roots": ["/srv/workspaces"],
   "poll_intervals": {
     "reconcile_seconds": 300,
@@ -84,8 +82,7 @@ Use the CLI to write the durable callback URL:
 
 ## Multi-project safety rules
 - one repo maps to one Jira project key
-- each registered Jira project gets its own Automation endpoint path
-- each registered Jira project gets its own webhook secret
+- polling JQL and comment checks are scoped to each repo's Jira project key
 - duplicate Jira project keys across repos must fail registration
 - all sticky comments, jobs, worktrees, and temporary files stay namespaced by project key
 
@@ -98,13 +95,22 @@ platform orchestrator register --target /srv/workspaces/<repo>
 That command:
 - appends the repo root to `projects_roots[]`
 - creates or reuses the control issue
-- creates or reuses project-scoped Automation rules when `public_base_url` is set
-- exports blueprint JSON when live Automation registration is unavailable
+- skips Jira Automation in polling mode
+- disables previously tracked webhook-mode Automation rules when switching an existing registration back to polling
+
+To opt in to webhook mode:
+
+```bash
+platform orchestrator register \
+  --target /srv/workspaces/<repo> \
+  --webhook \
+  --public-base-url https://orchestrator.<domain>
+```
 
 ## Validation checklist
-1. `curl https://orchestrator.<domain>/healthz`
-2. register two repos with different Jira project keys
-3. verify each project gets a different `/jira/events/<PROJECT_KEY>` target
-4. add `ai:auto` to one issue in each project
-5. confirm jobs, PRs, and Jira summary comments do not cross projects
+1. register two repos with different Jira project keys
+2. run `platform orchestrator run --poll-only`
+3. add `ai:auto` to one issue in each project
+4. confirm jobs, PRs, and Jira summary comments do not cross projects
+5. confirm `/ai pause` or `/ai status` comments are picked up by polling
 6. confirm Codex review arrives as a real GitHub review or the worker marks the issue blocked after fallback timeout

@@ -1521,20 +1521,23 @@ def check_orchestrator_registration(target: Path, manifest: dict[str, Any]) -> l
         warnings.append(
             f"Orchestrator project `{project_key}` is registered to `{registered_repo}`, not this target."
         )
-    if not settings.public_base_url:
+    event_mode = str(getattr(settings, "event_mode", "polling"))
+    if event_mode == "webhook" and not settings.public_base_url:
         warnings.append(
             "Orchestrator public_base_url is not configured. Jira Automation callbacks need a fixed public URL. "
             "Run `platform orchestrator configure --public-base-url https://orchestrator.<domain>` on the worker host, then re-run `platform orchestrator register --target <repo>`."
         )
-    if not project.get("webhook_secret"):
+    if event_mode == "webhook" and not project.get("webhook_secret"):
         warnings.append(
             "Orchestrator registration is missing a project webhook secret. Re-run `platform orchestrator register --target <repo>`."
         )
     if not project.get("control_issue_key"):
         warnings.append(
-            "Orchestrator registration has no Jira control issue. Live Automation setup may have been skipped."
+            "Orchestrator registration has no Jira control issue. Re-run `platform orchestrator register --target <repo>` to enable project-level control commands."
         )
-    if not project.get("lifecycle_rule_uuid") or not project.get("comment_rule_uuid"):
+    if event_mode == "webhook" and (
+        not project.get("lifecycle_rule_uuid") or not project.get("comment_rule_uuid")
+    ):
         warnings.append(
             "Orchestrator Automation rule IDs are missing. Confirm Jira Automation rules were created or import the exported blueprints."
         )

@@ -64,6 +64,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 config=str(config_path),
                 bind_host="127.0.0.1",
                 bind_port=8788,
+                event_mode=None,
                 public_base_url="orchestrator.example.com",
                 clear_public_base_url=False,
                 project_root=[str(project_root)],
@@ -79,6 +80,91 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertEqual(payload["public_base_url"], "https://orchestrator.example.com")
             self.assertIn(str(project_root.resolve()), payload["projects_roots"])
             self.assertEqual(payload["jira_site_url"], "https://ssbot.atlassian.net")
+
+    def test_default_event_mode_is_polling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "orchestrator.json"
+            settings = orchestrator.load_worker_settings(config_override=str(config_path))
+
+            self.assertEqual(settings.event_mode, "polling")
+
+    def test_register_polling_mode_does_not_create_webhook_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            manifest = repo / ".platform" / "platform.yaml"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "issue": {"project_key": "BILL"},
+                        "integrations": {
+                            "atlassian": {"confluence_space": "ENG"},
+                            "github": {
+                                "source_repo": "takey7/platform",
+                                "workflow_ref": "v0.1.8",
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config_path = Path(tmpdir) / "orchestrator.json"
+            args = SimpleNamespace(
+                target=str(repo),
+                config=str(config_path),
+                bind_host=None,
+                bind_port=None,
+                event_mode="polling",
+                webhook=False,
+                public_base_url=None,
+                listen_url=None,
+                webhook_secret=None,
+                shared_secret=None,
+            )
+            original_token = orchestrator.atlassian_api_token
+            original_state_dir = orchestrator.default_state_dir
+            try:
+                orchestrator.atlassian_api_token = lambda: ""
+                orchestrator.default_state_dir = lambda: Path(tmpdir) / "state"
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    orchestrator.cmd_register(args)
+            finally:
+                orchestrator.atlassian_api_token = original_token
+                orchestrator.default_state_dir = original_state_dir
+
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "state" / orchestrator.DB_FILENAME)
+            project = store.project("BILL")
+            self.assertEqual(project["webhook_secret"], "")
+            self.assertEqual(project["lifecycle_rule_uuid"], "")
+            self.assertIn("polling mode", output.getvalue())
+
+    def test_disable_automation_rules_sets_state_disabled(self) -> None:
+        calls: list[tuple[str, str, dict | None]] = []
+
+        def fake_automation_request(_settings, *, method: str, path: str, payload=None):
+            calls.append((method, path, payload))
+            if method == "GET":
+                return {
+                    "rule": {
+                        "name": "BILL / AI comments",
+                        "state": "ENABLED",
+                        "components": [],
+                    },
+                    "connections": [],
+                }
+            return {"ruleUuid": "rule-1"}
+
+        original_request = orchestrator.automation_request
+        try:
+            orchestrator.automation_request = fake_automation_request
+            disabled = orchestrator.disable_automation_rules(SimpleNamespace(), ["rule-1", "rule-1"])
+        finally:
+            orchestrator.automation_request = original_request
+
+        self.assertEqual(disabled, ["rule-1"])
+        put_payload = calls[-1][2]
+        self.assertEqual(calls[-1][0], "PUT")
+        self.assertEqual(put_payload["rule"]["state"], "DISABLED")
 
     def test_issue_is_auto_ready(self) -> None:
         issue = {
@@ -224,6 +310,61 @@ class PlatformOrchestratorTests(unittest.TestCase):
             store.clear_all_leases()
             self.assertTrue(store.acquire_lease(str(project.repo_path), "BILL-2"))
 
+    def test_poll_jira_control_comments_applies_pause_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            repo = Path(tmpdir) / "billing-api"
+            repo.mkdir()
+            project = orchestrator.RepoProject(
+                project_key="BILL",
+                repo_path=repo,
+                repo_name="billing-api",
+                confluence_space="ENG",
+                codex_review_mode="auto_required",
+                manifest_path=repo / ".platform" / "platform.yaml",
+                source_repo="takey7/platform",
+                workflow_ref="v0.1.5",
+            )
+            store.sync_projects([project])
+            store.update_project_registration(
+                project_key="BILL",
+                jira_project_id="10000",
+                control_issue_key="BILL-0",
+                lifecycle_rule_uuid="",
+                comment_rule_uuid="",
+                webhook_secret="",
+            )
+            store.enqueue_issue(
+                project_key="BILL",
+                repo_path=str(repo),
+                issue_key="BILL-1",
+                status="To Do",
+                summary="poll comments",
+            )
+            settings = SimpleNamespace()
+            service = orchestrator.OrchestratorService(settings=settings, store=store)
+            original_comments = orchestrator.jira_issue_comments
+            try:
+                orchestrator.jira_issue_comments = lambda _settings, issue_key: (
+                    [
+                        {
+                            "id": "comment-1",
+                            "body": orchestrator.jira_adf_from_text("/ai pause"),
+                        }
+                    ]
+                    if issue_key == "BILL-1"
+                    else []
+                )
+
+                first = service.poll_jira_control_comments("BILL")
+                second = service.poll_jira_control_comments("BILL")
+            finally:
+                orchestrator.jira_issue_comments = original_comments
+
+            self.assertEqual(first, 1)
+            self.assertEqual(second, 0)
+            self.assertEqual(store.get_job("BILL-1")["requested_action"], "pause")
+
     def test_healthz_supports_get(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SimpleNamespace(
@@ -270,6 +411,32 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertEqual(job["state"], "waiting_review")
             self.assertEqual(job["pr_url"], "https://example/pr/1")
             self.assertEqual(job["summary"], "updated summary")
+
+    def test_enqueue_issue_does_not_requeue_blocked_failed_or_paused_jobs(self) -> None:
+        for state in ("blocked", "failed", "paused"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmpdir:
+                store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+                store.enqueue_issue(
+                    project_key="BILL",
+                    repo_path="/tmp/billing-api",
+                    issue_key="BILL-1",
+                    status="To Do",
+                    summary="first pass",
+                )
+                store.update_job("BILL-1", state=state, latest_error="manual action required")
+
+                store.enqueue_issue(
+                    project_key="BILL",
+                    repo_path="/tmp/billing-api",
+                    issue_key="BILL-1",
+                    status="To Do",
+                    summary="polling refresh",
+                )
+
+                job = store.get_job("BILL-1")
+                self.assertEqual(job["state"], state)
+                self.assertEqual(job["latest_error"], "manual action required")
+                self.assertEqual(job["summary"], "polling refresh")
 
     def test_recover_inflight_jobs_requeues_processing_states(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

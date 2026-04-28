@@ -240,6 +240,43 @@ class PlatformCliTests(unittest.TestCase):
 
             self.assertTrue(any("Orchestrator registration not found" in warning for warning in warnings))
 
+    def test_orchestrator_polling_mode_does_not_require_public_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "repo"
+            target.mkdir()
+            manifest = {"issue": {"project_key": "DEMO"}}
+            original_load = platform.platform_orchestrator.load_worker_settings
+            original_store = platform.platform_orchestrator.OrchestratorStore
+            try:
+                platform.platform_orchestrator.load_worker_settings = lambda: SimpleNamespace(
+                    db_path=Path(tmpdir) / "orchestrator.db",
+                    public_base_url="",
+                    event_mode="polling",
+                )
+
+                class RegisteredStore:
+                    def __init__(self, _path: Path) -> None:
+                        pass
+
+                    def project(self, _project_key: str) -> dict[str, str]:
+                        return {
+                            "repo_path": str(target),
+                            "control_issue_key": "DEMO-1",
+                            "webhook_secret": "",
+                            "lifecycle_rule_uuid": "",
+                            "comment_rule_uuid": "",
+                        }
+
+                platform.platform_orchestrator.OrchestratorStore = RegisteredStore
+
+                warnings = platform.check_orchestrator_registration(target, manifest)
+            finally:
+                platform.platform_orchestrator.load_worker_settings = original_load
+                platform.platform_orchestrator.OrchestratorStore = original_store
+
+            self.assertFalse(any("public_base_url" in warning for warning in warnings))
+            self.assertFalse(any("Automation rule IDs" in warning for warning in warnings))
+
 
 if __name__ == "__main__":
     unittest.main()
