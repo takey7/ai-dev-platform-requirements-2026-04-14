@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "platform_orchestrator.py"
@@ -24,6 +25,34 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertEqual(orchestrator.parse_control_command("/ai pause"), "pause")
         self.assertEqual(orchestrator.parse_control_command("  /ai resume-project  "), "resume-project")
         self.assertEqual(orchestrator.parse_control_command("ship it"), "")
+
+    def test_atlassian_token_uses_keychain_when_env_missing(self) -> None:
+        with (
+            patch.dict(orchestrator.os.environ, {"USER": "tester"}, clear=True),
+            patch.object(orchestrator.sys, "platform", "darwin"),
+            patch.object(orchestrator.shutil, "which", return_value="/usr/bin/security"),
+            patch.object(
+                orchestrator.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=0, stdout="stored-token\n"),
+            ) as run_security,
+        ):
+            self.assertEqual(orchestrator.atlassian_api_token(), "stored-token")
+
+        run_security.assert_called_once_with(
+            [
+                "security",
+                "find-generic-password",
+                "-a",
+                "tester",
+                "-s",
+                orchestrator.ATLASSIAN_TOKEN_KEYCHAIN_SERVICE,
+                "-w",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
     def test_issue_is_auto_ready(self) -> None:
         issue = {

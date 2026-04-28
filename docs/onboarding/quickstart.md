@@ -22,7 +22,16 @@ Use login-based access for both tools. Do not make `OPENAI_API_KEY` part of the 
   --jira-admin-email you@example.com
 ```
 
-Export the Jira admin token only for provisioning:
+For local macOS operation, store the Jira admin token in Keychain:
+```bash
+security add-generic-password \
+  -a "$USER" \
+  -s ai-dev-platform.atlassian-api-token \
+  -w "<jira-admin-token>" \
+  -U
+```
+
+For one-off or Linux host operation, exporting the token is also supported:
 ```bash
 export ATLASSIAN_API_TOKEN=<jira-admin-token>
 ```

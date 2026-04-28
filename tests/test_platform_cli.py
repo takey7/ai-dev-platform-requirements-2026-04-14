@@ -63,6 +63,36 @@ class PlatformCliTests(unittest.TestCase):
         self.assertEqual(settings["source_ref"], "v9.9.9")
         self.assertEqual(settings["launch_mode"], "none")
 
+    def test_resolve_create_project_settings_reads_keychain_token(self) -> None:
+        args = argparse.Namespace(
+            project_name="Billing API",
+            github_owner="takey7",
+            root="/tmp/projects",
+            repo_name="billing-api",
+            jira_key="BILL",
+            jira_name="Billing API",
+            confluence_space=None,
+            source_repo="takey7/platform",
+            version="v1.0.0",
+            adapter="node-ts",
+            launch_mode="none",
+            keep_partials=False,
+        )
+        config = {
+            "jira": {
+                "site_url": "https://example.atlassian.net",
+                "admin_email": "admin@example.com",
+            },
+        }
+        original_token = platform.platform_orchestrator.atlassian_api_token
+        try:
+            platform.platform_orchestrator.atlassian_api_token = lambda: "stored-token"
+            settings = platform.resolve_create_project_settings(args, config)
+        finally:
+            platform.platform_orchestrator.atlassian_api_token = original_token
+
+        self.assertEqual(settings["jira_api_token"], "stored-token")
+
     def test_new_spec_rejects_foreign_project_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir)

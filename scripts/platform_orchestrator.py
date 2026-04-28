@@ -43,6 +43,7 @@ DEFAULT_FALLBACK_REVIEW_GRACE_SECONDS = 300
 DEFAULT_CLAUDE_TIMEOUT_SECONDS = 300
 DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 120
 DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS = 60
+ATLASSIAN_TOKEN_KEYCHAIN_SERVICE = "ai-dev-platform.atlassian-api-token"
 IGNORED_WORKTREE_PREFIXES = (".tmp/",)
 IGNORED_WORKTREE_PATHS = {
     ".platform/.last-validation.json",
@@ -106,6 +107,27 @@ class WorkerSettings:
     fallback_review_grace_seconds: int
     jira_site_url: str
     jira_admin_email: str
+
+
+def keychain_atlassian_api_token() -> str:
+    if sys.platform != "darwin" or shutil.which("security") is None:
+        return ""
+    command = ["security", "find-generic-password"]
+    account = os.environ.get("USER", "").strip()
+    if account:
+        command.extend(["-a", account])
+    command.extend(["-s", ATLASSIAN_TOKEN_KEYCHAIN_SERVICE, "-w"])
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def atlassian_api_token() -> str:
+    env_token = os.environ.get("ATLASSIAN_API_TOKEN", "").strip()
+    if env_token:
+        return env_token
+    return keychain_atlassian_api_token()
 
 
 def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -287,16 +309,17 @@ def cmd_register(args: argparse.Namespace) -> int:
     control_issue_key = ""
     lifecycle_rule_uuid = ""
     comment_rule_uuid = ""
+    api_token = atlassian_api_token()
     if (
         settings.public_base_url
         and settings.jira_site_url
         and settings.jira_admin_email
-        and os.environ.get("ATLASSIAN_API_TOKEN")
+        and api_token
     ):
         project_details = jira_get_project(
             site_url=settings.jira_site_url,
             admin_email=settings.jira_admin_email,
-            api_token=os.environ["ATLASSIAN_API_TOKEN"],
+            api_token=api_token,
             project_key=project.project_key,
         )
         project_id = str(project_details.get("id", ""))
@@ -1661,8 +1684,8 @@ def require_runtime_credentials(settings: WorkerSettings) -> None:
         missing.append("jira_site_url")
     if not settings.jira_admin_email:
         missing.append("jira_admin_email")
-    if not os.environ.get("ATLASSIAN_API_TOKEN"):
-        missing.append("ATLASSIAN_API_TOKEN")
+    if not atlassian_api_token():
+        missing.append(f"ATLASSIAN_API_TOKEN or Keychain:{ATLASSIAN_TOKEN_KEYCHAIN_SERVICE}")
     if shutil.which("gh") is None:
         missing.append("gh")
     if shutil.which("claude") is None:
@@ -1862,7 +1885,7 @@ def jira_primary_issue_type(settings: WorkerSettings, project_key: str) -> dict[
 
 
 def jira_request(settings: WorkerSettings, *, method: str, path: str, payload: Any | None = None) -> Any:
-    api_token = os.environ.get("ATLASSIAN_API_TOKEN", "")
+    api_token = atlassian_api_token()
     return jira_request_raw(
         site_url=settings.jira_site_url,
         admin_email=settings.jira_admin_email,
@@ -1883,7 +1906,10 @@ def jira_request_raw(
     payload: Any | None = None,
 ) -> Any:
     if not site_url or not admin_email or not api_token:
-        raise OrchestratorError("Jira request requires site URL, admin email, and ATLASSIAN_API_TOKEN.")
+        raise OrchestratorError(
+            "Jira request requires site URL, admin email, and ATLASSIAN_API_TOKEN "
+            f"or Keychain:{ATLASSIAN_TOKEN_KEYCHAIN_SERVICE}."
+        )
     url = f"{site_url}{path}"
     headers = {
         "Accept": "application/json",
@@ -1924,7 +1950,7 @@ def jira_cloud_id(settings: WorkerSettings) -> str:
 def automation_request(
     settings: WorkerSettings, *, method: str, path: str, payload: Any | None = None
 ) -> Any:
-    api_token = os.environ.get("ATLASSIAN_API_TOKEN", "")
+    api_token = atlassian_api_token()
     cloud_id = jira_cloud_id(settings)
     url = f"https://api.atlassian.com/automation/public/jira/{cloud_id}/rest/v1{path}"
     headers = {
@@ -2088,7 +2114,7 @@ def build_rule_payload(
     cloud_id = "{{CLOUD_ID}}"
     actor_account_id = "{{ACCOUNT_ID}}"
     public_base_url = settings.public_base_url or "{{PUBLIC_BASE_URL}}"
-    if settings.jira_site_url and settings.jira_admin_email and os.environ.get("ATLASSIAN_API_TOKEN"):
+    if settings.jira_site_url and settings.jira_admin_email and atlassian_api_token():
         cloud_id = jira_cloud_id(settings)
         actor_account_id = jira_request(settings, method="GET", path="/rest/api/3/myself").get("accountId", "")
     webhook_action = {

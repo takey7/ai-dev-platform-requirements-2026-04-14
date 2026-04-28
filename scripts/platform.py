@@ -768,7 +768,7 @@ def resolve_create_project_settings(
         "jira_key": jira_key,
         "jira_name": jira_name,
         "confluence_space": confluence_space,
-        "jira_api_token": os.environ.get("ATLASSIAN_API_TOKEN", ""),
+        "jira_api_token": platform_orchestrator.atlassian_api_token(),
     }
 
 
@@ -794,7 +794,9 @@ def preflight_create_project(settings: dict[str, Any]) -> None:
         )
     if not settings["jira_api_token"]:
         raise PlatformCommandError(
-            "ATLASSIAN_API_TOKEN is missing. Export it before running `platform create-project`."
+            "ATLASSIAN_API_TOKEN is missing. Export it or store it in macOS Keychain service "
+            f"`{platform_orchestrator.ATLASSIAN_TOKEN_KEYCHAIN_SERVICE}` before running "
+            "`platform create-project`."
         )
 
     gh_status = run_optional(["gh", "auth", "status"])

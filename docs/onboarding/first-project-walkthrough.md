@@ -67,10 +67,14 @@ User config は初期値の seed です。repo 作成後の正本は consumer re
 
 ## 4. 学習用 project を作る
 
-Jira project 作成だけは provisioning plane なので、実行時だけ `ATLASSIAN_API_TOKEN` が必要です。
+Jira project 作成だけは provisioning plane なので、ローカルでは macOS Keychain に保存した token を使います。環境変数 `ATLASSIAN_API_TOKEN` を一時 export しても動きます。
 
 ```bash
-export ATLASSIAN_API_TOKEN=<token>
+security add-generic-password \
+  -a "$USER" \
+  -s ai-dev-platform.atlassian-api-token \
+  -w "<jira-admin-token>" \
+  -U
 
 ./bin/platform create-project "Learning AI Flow" \
   --repo-name learning-ai-flow-<YYYYMMDD> \
@@ -78,8 +82,6 @@ export ATLASSIAN_API_TOKEN=<token>
   --jira-name "Learning AI Flow" \
   --confluence-space LEARN \
   --launch-mode none
-
-unset ATLASSIAN_API_TOKEN
 ```
 
 作成後に確認します。
@@ -222,4 +224,3 @@ Jira comment からも操作できます。
 /ai cancel
 /ai status
 ```
-

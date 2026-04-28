@@ -7,7 +7,7 @@
 - formal entrypoint: `./bin/platform`
 - Jira 既定テンプレート: `Kanban`
 - Claude / Codex は login-based auth
-- Jira project 作成や Automation rule 登録だけ `ATLASSIAN_API_TOKEN` を使う
+- Jira project 作成や Automation rule 登録だけ Jira admin token を使う
 
 ## 1. ローカル認証
 ```bash
@@ -35,7 +35,16 @@ cd /Users/jin/Downloads/ai-dev-platform-requirements-2026-04-14
   --launch-mode tmux
 ```
 
-Jira provisioning が必要なターンだけ token を export:
+ローカル macOS では token を Keychain に保存します:
+```bash
+security add-generic-password \
+  -a "$USER" \
+  -s ai-dev-platform.atlassian-api-token \
+  -w "<jira-admin-token>" \
+  -U
+```
+
+Linux host や一時実行では環境変数も使えます:
 ```bash
 export ATLASSIAN_API_TOKEN=<jira-admin-token>
 ```

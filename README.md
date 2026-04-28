@@ -60,7 +60,16 @@ codex login
   --jira-admin-email you@example.com
 ```
 
-Export the Jira provisioning token only when you need `create-project`:
+Store the Jira provisioning token in the local macOS Keychain, or export it only for the command that needs provisioning:
+```bash
+security add-generic-password \
+  -a "$USER" \
+  -s ai-dev-platform.atlassian-api-token \
+  -w "<jira-admin-token>" \
+  -U
+```
+
+Temporary env export is also supported:
 ```bash
 export ATLASSIAN_API_TOKEN=<jira-admin-token>
 ```
@@ -110,11 +119,11 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
 
 ### 8. Jira 駆動の常駐オーケストレータを登録する
 ```bash
-export ATLASSIAN_API_TOKEN=<jira-admin-token>
-
 ./bin/platform orchestrator register \
   --target /path/to/consumer-repo
 ```
+
+`ATLASSIAN_API_TOKEN` can come from the environment or macOS Keychain service `ai-dev-platform.atlassian-api-token`.
 
 - worker config を `~/.config/ai-dev-platform/orchestrator.json` に作る
 - `projects_roots[]` に repo の親ディレクトリを追加する
@@ -127,8 +136,6 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
 
 ### 9. 常駐 worker を起動する
 ```bash
-export ATLASSIAN_API_TOKEN=<jira-admin-token>
-
 ./bin/platform orchestrator run
 ```
 

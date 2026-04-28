@@ -20,10 +20,12 @@ The worker account must already be signed in to:
 - Claude Code
 - Codex CLI
 
-Export provisioning secrets through `/etc/platform-orchestrator.env` only:
+On Linux hosts, provide provisioning secrets through `/etc/platform-orchestrator.env` only:
 ```bash
 ATLASSIAN_API_TOKEN=<jira-admin-token>
 ```
+
+Local macOS runs may use Keychain service `ai-dev-platform.atlassian-api-token`, but permanent Linux worker hosts should use the systemd environment file with locked-down permissions.
 
 Do not write Jira admin credentials into consuming repos.
 
