@@ -30,7 +30,7 @@ DEFAULT_ADAPTER = "node-ts"
 DEFAULT_DEPLOY_MODE = "staging-prod"
 DEFAULT_LAUNCH_MODE = "tmux"
 DEFAULT_CODEX_REVIEW_MODE = "auto_required"
-DEFAULT_CODEX_REVIEW_AUTHORS = ("codex", "codex[bot]")
+DEFAULT_CODEX_REVIEW_AUTHORS = ("codex", "codex[bot]", "chatgpt-codex-connector")
 CODEX_CODE_REVIEW_SETTINGS_URL = "https://chatgpt.com/codex/settings/code-review"
 OPENAI_CODEX_GITHUB_DOC_URL = "https://developers.openai.com/codex/integrations/github"
 OPENAI_CODEX_CLOUD_DOC_URL = "https://developers.openai.com/codex/cloud"
@@ -483,7 +483,7 @@ def cmd_codex_review(args: argparse.Namespace) -> int:
         for warning in warnings:
             print(f"- {warning}")
     else:
-        print("PR review health: real Codex review artifact found in recent PRs")
+        print("PR review health: Codex review artifact found in recent PRs")
 
     if isinstance(prs, list) and prs:
         latest = prs[0]
@@ -1452,18 +1452,26 @@ def codex_review_health_from_prs(prs: Any) -> list[str]:
                 return []
         comments = pr.get("comments", []) if isinstance(pr, dict) else []
         for comment in comments:
+            if is_codex_review_comment(comment, authors):
+                return []
             body = str(comment.get("body", ""))
             if "@codex review" in body.lower():
                 fallback_requested = True
     if fallback_requested:
         return [
-            "Recent PRs show `@codex review` fallback requests, but no real Codex review artifact. "
+            "Recent PRs show `@codex review` fallback requests, but no Codex review artifact. "
             f"Enable repo-level Code review in Codex settings ({CODEX_CODE_REVIEW_SETTINGS_URL})."
         ]
     return [
-        "Automatic Codex review is not verified: recent PRs do not show a real Codex review artifact. "
+        "Automatic Codex review is not verified: recent PRs do not show a Codex review artifact. "
         f"Run `platform codex-review --target <repo> --open-settings` and enable the repo in Codex settings ({CODEX_CODE_REVIEW_SETTINGS_URL})."
     ]
+
+
+def is_codex_review_comment(comment: dict[str, Any], authors: set[str]) -> bool:
+    login = str(comment.get("author", {}).get("login", "")).lower()
+    body = str(comment.get("body", "")).lower()
+    return login in authors and "codex review:" in body
 
 
 def infer_repo_full_name(target: Path) -> str | None:

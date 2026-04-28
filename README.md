@@ -149,7 +149,7 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
 ./bin/platform codex-review --target /path/to/consumer-repo --open-settings
 ```
 
-Codex GitHub review の有効化は ChatGPT/Codex settings 側の repo 単位トグルです。CLI は設定画面を開き、認証、PR review artifact、`@codex review` fallback を検査します。
+Codex GitHub review の有効化は ChatGPT/Codex settings 側の repo 単位トグルです。CLI は設定画面を開き、認証、Codex review artifact、`@codex review` fallback を検査します。
 
 ### 10. status / pause / resume / cancel
 ```bash
@@ -205,7 +205,7 @@ codex --version
   - `ai-gate`
   - `release-ready`
 - `ai-gate` は `OPENAI_API_KEY` を使う GitHub Action ではなく、ChatGPT/GitHub 連携済みの Codex review を使う運用ガイド check として動かす
-- Codex review は GitHub 側で automatic reviews を有効化するのを既定にし、Worker は実 review artifact を待つ
+- Codex review は GitHub 側で automatic reviews を有効化するのを既定にし、Worker は GitHub review または `chatgpt-codex-connector` の `Codex Review:` comment artifact を待つ
 - automatic review が来ない場合だけ、Worker が PR 上で `@codex review` を fallback として送る
 - source repo を private にする場合は、GitHub Actions の repository settings で
   `Accessible from repositories owned by '<OWNER>'`

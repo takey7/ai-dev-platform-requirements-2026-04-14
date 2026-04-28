@@ -192,7 +192,7 @@ repo 側では automatic Codex review を有効化します。
 worker の動作:
 1. PR 作成
 2. required checks 待ち
-3. real Codex review artifact 待ち
+3. Codex review artifact 待ち
 4. 来なければ `@codex review` fallback
 5. それでも来なければ Jira に `blocked` を返す
 
@@ -209,7 +209,7 @@ worker が止まっていた場合は、GitHub 状態を手動で再取得しま
 ./bin/platform orchestrator status --issue <ISSUE_KEY>
 ```
 
-`@codex review` の comment だけでは完了扱いにしません。GitHub 上の real review artifact が無い場合は、一定時間後に Jira へ `blocked` として書き戻します。
+`@codex review` の comment だけでは完了扱いにしません。GitHub 上の review、または `chatgpt-codex-connector` の `Codex Review:` comment が無い場合は、一定時間後に Jira へ `blocked` として書き戻します。
 
 ## 11. 複数 project で混ざらないことの確認
 以下を project ごとに確認します。

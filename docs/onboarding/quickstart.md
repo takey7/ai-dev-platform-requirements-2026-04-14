@@ -121,8 +121,8 @@ Then:
 ## 10. Enable GitHub-side Codex reviews
 - connect ChatGPT/Codex to GitHub
 - enable automatic Codex reviews on each repo
-- the worker waits for a real Codex review artifact and only falls back to `@codex review` if nothing arrives
-- posting `@codex review` is not completion; the worker waits for an actual GitHub review from `codex` or `codex[bot]`
+- the worker waits for a Codex review artifact and only falls back to `@codex review` if nothing arrives
+- posting `@codex review` is not completion; the worker waits for a GitHub review from `codex` / `codex[bot]` or a `Codex Review:` comment from `chatgpt-codex-connector`
 - the shared `ai-gate` workflow is informational and does not require `OPENAI_API_KEY`
 
 ## 11. Jira issue creation from Claude

@@ -592,6 +592,23 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertFalse(summary["changes_requested"])
         self.assertIn("commented", summary["summary"])
 
+    def test_summarize_reviews_detects_codex_connector_comment(self) -> None:
+        summary = orchestrator.summarize_reviews(
+            [],
+            ("codex", "codex[bot]"),
+            [
+                {
+                    "author": {"login": "chatgpt-codex-connector"},
+                    "body": "Codex Review: Didn't find any major issues.",
+                }
+            ],
+        )
+
+        self.assertTrue(summary["reviewed"])
+        self.assertTrue(summary["approved"])
+        self.assertFalse(summary["changes_requested"])
+        self.assertIn("no major issues", summary["summary"])
+
     def test_load_orchestrator_config_migrates_legacy_listen_url(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "orchestrator.json"

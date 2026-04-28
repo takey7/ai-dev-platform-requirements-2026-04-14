@@ -171,7 +171,7 @@ worker が止まっていた、または GitHub 状態が古そうな場合:
 
 ## 10. Codex review の確認
 
-GitHub checks が成功しても、real Codex review artifact が無ければ完了扱いにしません。
+GitHub checks が成功しても、Codex review artifact が無ければ完了扱いにしません。
 
 ```bash
 gh pr list --repo <GITHUB_OWNER>/learning-ai-flow-<YYYYMMDD> --state open
@@ -181,9 +181,9 @@ gh pr view <PR_NUMBER> --repo <GITHUB_OWNER>/learning-ai-flow-<YYYYMMDD> --json 
 期待結果:
 
 - required checks が success
-- `reviews` に `codex` または `codex[bot]` の review が存在する
+- `reviews` に `codex` / `codex[bot]` の review があるか、`comments` に `chatgpt-codex-connector` の `Codex Review:` comment が存在する
 - review が来ない場合、worker は `@codex review` fallback を投稿する
-- fallback 後も review が来なければ Jira に `blocked` として設定不足を書き戻す
+- fallback 後も Codex review artifact が来なければ Jira に `blocked` として設定不足を書き戻す
 
 Codex review は CLI から強制有効化できません。repo ごとに GitHub/Codex 側で automatic review を有効化してください。
 

@@ -38,7 +38,7 @@ DEFAULT_EVENT_MODE = "polling"
 DEFAULT_GITHUB_MODE = "polling"
 DEFAULT_HEADER_NAME = "X-Platform-Orchestrator-Secret"
 LEGACY_HEADER_NAME = "X-Platform-Shared-Secret"
-DEFAULT_CODEX_REVIEW_AUTHORS = ("codex", "codex[bot]")
+DEFAULT_CODEX_REVIEW_AUTHORS = ("codex", "codex[bot]", "chatgpt-codex-connector")
 DEFAULT_AUTO_REVIEW_GRACE_SECONDS = 180
 DEFAULT_FALLBACK_REVIEW_GRACE_SECONDS = 300
 DEFAULT_CLAUDE_TIMEOUT_SECONDS = 300
@@ -1029,6 +1029,7 @@ class OrchestratorService:
             review_summary = summarize_reviews(
                 pr.get("reviews", []),
                 self.settings.codex_review_authors,
+                pr.get("comments", []),
             )
             check_summary = summarize_checks(pr.get("statusCheckRollup", []))
             if pr.get("state") == "MERGED":
@@ -2776,13 +2777,40 @@ def github_pull_request_status(worktree_path: Path, branch: str, pr_number: str)
     return json.loads(result.stdout)
 
 
-def summarize_reviews(reviews: list[dict[str, Any]], codex_review_authors: tuple[str, ...]) -> dict[str, Any]:
-    normalized_authors = {item.lower() for item in codex_review_authors}
+def summarize_reviews(
+    reviews: list[dict[str, Any]],
+    codex_review_authors: tuple[str, ...],
+    comments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    normalized_authors = {item.lower() for item in codex_review_authors} | {
+        item.lower() for item in DEFAULT_CODEX_REVIEW_AUTHORS
+    }
     codex_reviews = [
         review
         for review in reviews
         if str(review.get("author", {}).get("login", "")).lower() in normalized_authors
     ]
+    codex_comments = [
+        comment
+        for comment in (comments or [])
+        if is_codex_review_comment(comment, normalized_authors)
+    ]
+    if codex_comments:
+        latest = codex_comments[-1]
+        body = str(latest.get("body", "")).lower()
+        no_major_issues = (
+            "didn't find any major issues" in body
+            or "did not find any major issues" in body
+            or "no major issues" in body
+        )
+        return {
+            "reviewed": True,
+            "approved": no_major_issues,
+            "changes_requested": not no_major_issues,
+            "summary": "Codex review comment: no major issues."
+            if no_major_issues
+            else "Codex review comment returned feedback.",
+        }
     if not codex_reviews:
         return {
             "reviewed": False,
@@ -2808,6 +2836,12 @@ def summarize_reviews(reviews: list[dict[str, Any]], codex_review_authors: tuple
         "changes_requested": changes_requested,
         "summary": summary,
     }
+
+
+def is_codex_review_comment(comment: dict[str, Any], authors: set[str]) -> bool:
+    login = str(comment.get("author", {}).get("login", "")).lower()
+    body = str(comment.get("body", "")).lower()
+    return login in authors and "codex review:" in body
 
 
 def summarize_checks(items: list[dict[str, Any]]) -> dict[str, Any]:

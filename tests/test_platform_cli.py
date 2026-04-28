@@ -211,6 +211,23 @@ class PlatformCliTests(unittest.TestCase):
 
         self.assertEqual(warnings, [])
 
+    def test_codex_review_health_accepts_codex_connector_comment(self) -> None:
+        warnings = platform.codex_review_health_from_prs(
+            [
+                {
+                    "reviews": [],
+                    "comments": [
+                        {
+                            "author": {"login": "chatgpt-codex-connector"},
+                            "body": "Codex Review: Didn't find any major issues.",
+                        }
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(warnings, [])
+
     def test_orchestrator_registration_missing_warns(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir)

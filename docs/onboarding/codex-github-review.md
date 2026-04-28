@@ -53,7 +53,7 @@ The command skips duplicate `@codex review` comments by default. To post again:
 platform codex-review --target . --request-pr <PR_NUMBER> --force-comment
 ```
 
-Then check for a real review artifact:
+Then check for a Codex review artifact:
 
 ```bash
 gh pr view <PR_NUMBER> \
@@ -61,7 +61,7 @@ gh pr view <PR_NUMBER> \
   --jq '{reviewDecision, reviews, comments: [.comments[].body]}'
 ```
 
-A plain `@codex review` comment is only a request. The platform treats the review as complete only after GitHub shows an actual review from `codex` or `codex[bot]`.
+A plain `@codex review` comment is only a request. The platform treats the review as complete after GitHub shows either a review from `codex` / `codex[bot]` or a `Codex Review:` comment from `chatgpt-codex-connector`.
 
 ## 4. Orchestrator behavior
 
@@ -71,6 +71,6 @@ The worker flow is:
 2. wait for GitHub checks
 3. wait for automatic Codex review
 4. if no review arrives, post `@codex review`
-5. if no real review arrives after the fallback grace period, mark the Jira job `blocked`
+5. if no Codex review artifact arrives after the fallback grace period, mark the Jira job `blocked`
 
-This prevents a comment-only request from being mistaken for an actual review.
+This prevents a request-only comment from being mistaken for a completed review.

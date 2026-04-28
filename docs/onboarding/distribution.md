@@ -52,7 +52,7 @@
 - run the worker under a dedicated account already logged into `gh`, `claude`, and `codex`
 - use Jira label `ai:auto` as the start gate and comment commands for pause/resume/cancel/status
 - treat `ready_for_merge` as the worker stop state in v1; do not auto-merge by default
-- enable automatic Codex review on each repo; the worker only falls back to `@codex review` if no real review artifact arrives
+- enable automatic Codex review on each repo; the worker only falls back to `@codex review` if no Codex review artifact arrives
 - use `platform orchestrator poll` or `status --refresh` when the worker was stopped and GitHub check/review state needs to be reconciled manually
 - use webhook mode only when low-latency Jira events are worth maintaining a public callback URL
 
@@ -66,7 +66,7 @@
 - keep the source repo name stable after publishing; reusable workflow references do not follow repository renames or redirects
 - connect Codex to GitHub through ChatGPT when you want automatic PR reviews or `@codex` review requests
 - do not require `OPENAI_API_KEY` for the default `ai-gate` path
-- monitor recent PRs for an actual Codex review artifact, not just a comment request
+- monitor recent PRs for a Codex review artifact, not just a request comment
 
 ## Claude plugin publish checklist
 - keep `.claude-plugin/marketplace.json` at the repository root
