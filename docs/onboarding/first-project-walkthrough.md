@@ -105,10 +105,17 @@ security add-generic-password \
 
 ## 6. Worker を起動する
 
-固定 host では systemd が起動します。手元で確認する場合:
+固定 Linux host では systemd が起動します。手元で確認する場合:
 
 ```bash
 ./bin/platform orchestrator run --poll-only
+```
+
+ローカル Mac でログイン時に再起動させる場合:
+
+```bash
+./bin/platform orchestrator install-agent
+./bin/platform orchestrator agent-status
 ```
 
 別 terminal で `platform orchestrator status --project <PROJECT_KEY>` を確認します。
@@ -147,6 +154,8 @@ worker が polling で issue/comment を拾うと、次を進めます。
 - GitHub checks 待ち
 - Codex review artifact 待ち
 - Jira sticky comment 更新
+- Jira status を作業開始で `In Progress` / `進行中` / `作業中` へ移動
+- PR merge 後だけ Jira status を `Done` / `完了` へ移動
 
 ## 9. 状態確認
 
@@ -197,6 +206,8 @@ Codex review は CLI から強制有効化できません。repo ごとに GitHu
 - Jira issue から PR が作られている
 - GitHub required checks が動いている
 - Jira sticky comment に state / branch / PR URL / checks / review が表示されている
+- `ready_for_merge` では Jira が Done にならない
+- PR merge 後の poll で Jira が Done になる
 - Codex review が来ない場合でも、理由が Jira に `blocked` として返る
 
 ## 12. よくある停止操作

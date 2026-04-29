@@ -232,6 +232,10 @@ class PlatformCliTests(unittest.TestCase):
             manifest["integrations"]["github"]["codex_review"]["mode"],
             platform.DEFAULT_CODEX_REVIEW_MODE,
         )
+        self.assertEqual(
+            manifest["integrations"]["atlassian"]["transition_policy"]["mode"],
+            "kanban_minimal",
+        )
 
     def test_inspect_target_flags_foreign_spec_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -31,6 +31,11 @@ DEFAULT_DEPLOY_MODE = "staging-prod"
 DEFAULT_LAUNCH_MODE = "tmux"
 DEFAULT_CODEX_REVIEW_MODE = "auto_required"
 DEFAULT_CODEX_REVIEW_AUTHORS = ("codex", "codex[bot]", "chatgpt-codex-connector")
+DEFAULT_TRANSITION_POLICY = {
+    "mode": "kanban_minimal",
+    "active_statuses": ["In Progress", "進行中", "作業中"],
+    "done_statuses": ["Done", "完了"],
+}
 CODEX_CODE_REVIEW_SETTINGS_URL = "https://chatgpt.com/codex/settings/code-review"
 OPENAI_CODEX_GITHUB_DOC_URL = "https://developers.openai.com/codex/integrations/github"
 OPENAI_CODEX_CLOUD_DOC_URL = "https://developers.openai.com/codex/cloud"
@@ -843,6 +848,7 @@ def build_manifest(
                 "project_scoped": True,
                 "api_token_opt_in": False,
                 "confluence_space": context["CONFLUENCE_SPACE"],
+                "transition_policy": DEFAULT_TRANSITION_POLICY,
             },
             "github": {
                 "source_repo": context["SOURCE_REPO"],
@@ -949,6 +955,7 @@ def inspect_target(target: Path) -> tuple[list[str], list[str]]:
         warnings.append(
             "Source repo still uses the placeholder owner. Re-run bootstrap/upgrade with --source-repo."
         )
+    warnings.extend(validate_transition_policy_shape(manifest))
 
     warnings.extend(check_codex_review_health(target, manifest))
     warnings.extend(check_orchestrator_registration(target, manifest))
@@ -1807,6 +1814,28 @@ def validate_manifest_shape(manifest: dict[str, Any]) -> list[str]:
         elif not isinstance(manifest[key], expected_type):
             errors.append(f"Manifest key `{key}` must be an object.")
     return errors
+
+
+def validate_transition_policy_shape(manifest: dict[str, Any]) -> list[str]:
+    policy = (
+        manifest.get("integrations", {})
+        .get("atlassian", {})
+        .get("transition_policy")
+    )
+    if policy is None:
+        return []
+    warnings: list[str] = []
+    if not isinstance(policy, dict):
+        return ["Atlassian transition_policy should be an object; default kanban_minimal will be used by the worker."]
+    if policy.get("mode", "kanban_minimal") != "kanban_minimal":
+        warnings.append("Atlassian transition_policy.mode is not `kanban_minimal`; the v1 worker will skip Jira status transitions.")
+    for key in ("active_statuses", "done_statuses"):
+        value = policy.get(key)
+        if value is not None and (
+            not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value)
+        ):
+            warnings.append(f"Atlassian transition_policy.{key} should be a non-empty string list.")
+    return warnings
 
 
 def check_codex_review_health(target: Path, manifest: dict[str, Any]) -> list[str]:

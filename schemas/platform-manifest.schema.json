@@ -183,6 +183,37 @@
             },
             "confluence_space": {
               "type": "string"
+            },
+            "transition_policy": {
+              "type": "object",
+              "required": [
+                "mode"
+              ],
+              "properties": {
+                "mode": {
+                  "type": "string",
+                  "enum": [
+                    "kanban_minimal"
+                  ]
+                },
+                "active_statuses": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "minItems": 1
+                },
+                "done_statuses": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "minItems": 1
+                }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false

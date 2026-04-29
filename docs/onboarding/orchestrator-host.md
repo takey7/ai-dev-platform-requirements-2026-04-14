@@ -5,6 +5,7 @@
 - one dedicated OS user: `platform-orchestrator`
 - one resident worker process
 - optional public HTTPS endpoint only if webhook mode is enabled
+- local macOS always-on runs use a user LaunchAgent instead of systemd
 
 ## Required runtime on the host
 - `gh`
@@ -41,6 +42,34 @@ Do not write Jira admin credentials into consuming repos.
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now platform-orchestrator
+```
+
+The bundled unit uses `Restart=always`. On restart, the worker reopens the SQLite WAL state DB and requeues inflight `planning` / `coding` / `reviewing` / `pr_open` jobs so polling can resume from the last stored checkpoint.
+
+## macOS LaunchAgent
+Use this only for a logged-in local Mac worker. This is the correct local mode because `gh`, `claude`, `codex`, Keychain, and MCP auth are user-session scoped.
+
+```bash
+./bin/platform orchestrator install-agent
+./bin/platform orchestrator agent-status
+```
+
+This installs `~/Library/LaunchAgents/com.ai-dev-platform.orchestrator.plist` with `RunAtLoad=true` and `KeepAlive=true`.
+
+Logs:
+- `~/Library/Logs/ai-dev-platform/orchestrator.out.log`
+- `~/Library/Logs/ai-dev-platform/orchestrator.err.log`
+
+To inspect without installing:
+
+```bash
+./bin/platform orchestrator install-agent --dry-run
+```
+
+To remove:
+
+```bash
+./bin/platform orchestrator uninstall-agent
 ```
 
 ## Optional Caddy
@@ -130,3 +159,5 @@ platform orchestrator register \
 4. confirm jobs, PRs, and Jira summary comments do not cross projects
 5. confirm `/ai pause` or `/ai status` comments are picked up by polling
 6. confirm Codex review arrives as a real GitHub review or the worker marks the issue blocked after fallback timeout
+7. confirm Jira moves to `In Progress` / `進行中` / `作業中` after the job starts
+8. confirm Jira does not move to `Done` / `完了` at `ready_for_merge`; it moves only after the PR is merged

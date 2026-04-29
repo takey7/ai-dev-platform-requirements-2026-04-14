@@ -49,9 +49,11 @@
 ## Orchestrator rollout checklist
 - register each consuming repo with `platform orchestrator register --target <repo>`
 - run `platform orchestrator run --poll-only`
+- for local macOS always-on use `platform orchestrator install-agent`; for Linux worker hosts use the bundled systemd unit
 - run the worker under a dedicated account already logged into `gh`, `claude`, and `codex`
 - use Jira label `ai:auto` as the start gate and comment commands for pause/resume/cancel/status
 - treat `ready_for_merge` as the worker stop state in v1; do not auto-merge by default
+- move Jira to `In Progress` when work starts and to `Done` only after PR merge
 - enable automatic Codex review on each repo; the worker only falls back to `@codex review` if no Codex review artifact arrives
 - use `platform orchestrator poll` or `status --refresh` when the worker was stopped and GitHub check/review state needs to be reconciled manually
 - use webhook mode only when low-latency Jira events are worth maintaining a public callback URL

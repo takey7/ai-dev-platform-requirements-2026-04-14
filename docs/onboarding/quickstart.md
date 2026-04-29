@@ -117,9 +117,15 @@ Webhook mode is optional. Only use it when you intentionally want Jira Automatio
 ./bin/platform orchestrator run --poll-only
 ```
 
-The worker keeps a SQLite WAL state DB under `~/.local/state/ai-dev-platform/orchestrator/`, polls Jira issues/comments and GitHub checks/reviews, mirrors progress to Jira, and stops at `ready_for_merge`.
+The worker keeps a SQLite WAL state DB under `~/.local/state/ai-dev-platform/orchestrator/`, polls Jira issues/comments and GitHub checks/reviews, mirrors progress to Jira, moves active jobs to `In Progress` best-effort, and stops at `ready_for_merge`. Jira moves to `Done` only after the PR is merged.
 
 For always-on hosting, use the worker host layout in [orchestrator-host.md](orchestrator-host.md). A public URL is required only for optional webhook mode.
+
+On a local Mac, install a user LaunchAgent when you want the polling worker to restart after login:
+```bash
+./bin/platform orchestrator install-agent
+./bin/platform orchestrator agent-status
+```
 
 If the worker is not running and a job is waiting on GitHub, refresh state manually:
 ```bash

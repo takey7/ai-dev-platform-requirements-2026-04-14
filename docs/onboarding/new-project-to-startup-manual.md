@@ -78,7 +78,7 @@ cat ~/workspaces/<repo-name>/.platform/platform.yaml
 ## 4. worker を用意する
 既定は polling-first です。ローカル Mac から Jira REST / GitHub CLI へ outbound 接続するだけなので、public HTTPS URL は不要です。
 
-常時稼働させたい場合だけ Linux VM + systemd を使います。詳細は [orchestrator-host.md](orchestrator-host.md) を参照してください。
+ローカル Mac でログイン後も自動再起動したい場合は LaunchAgent を使います。headless の恒久 worker は Linux VM + systemd を使います。詳細は [orchestrator-host.md](orchestrator-host.md) を参照してください。
 
 worker config の確認:
 ```bash
@@ -155,6 +155,12 @@ webhook mode が必要な場合だけ、明示的に opt-in します。
 ./bin/platform orchestrator status --project <PROJECT_KEY>
 ```
 
+ローカル Mac でログイン時に自動起動させる場合:
+```bash
+./bin/platform orchestrator install-agent
+./bin/platform orchestrator agent-status
+```
+
 ## 7. Jira issue を作る
 通常運用では **Claude + MCP** を使います。CLI 追加コマンドは使いません。
 
@@ -176,13 +182,14 @@ claude -p --permission-mode bypassPermissions \
 
 その後 worker は:
 1. Jira issue を読む
-2. `docs/specs/<ISSUE>.md` を生成する
-3. worktree と branch を作る
-4. Claude planning -> Codex coding/review -> Claude integrate を回す
-5. PR を作る
-6. GitHub checks を待つ
-7. Codex review artifact を待つ
-8. `ready_for_merge` か `blocked` を Jira sticky comment に返す
+2. Jira status を `In Progress` / `進行中` / `作業中` へ best-effort transition する
+3. `docs/specs/<ISSUE>.md` を生成する
+4. worktree と branch を作る
+5. Claude planning -> Codex coding/review -> Claude integrate を回す
+6. PR を作る
+7. GitHub checks を待つ
+8. Codex review artifact を待つ
+9. `ready_for_merge` か `blocked` を Jira sticky comment に返す
 
 ## 9. 日常の監視と操作
 status:
@@ -262,3 +269,4 @@ worker が止まっていた場合は、GitHub 状態を手動で再取得しま
 - Claude の Jira issue 作成は explicit-only
 - Codex review は automatic review を正道、`@codex review` は fallback
 - Worker は `ready_for_merge` で止まり、merge は人または GitHub rules に委ねる
+- Jira は作業開始で `In Progress` 相当、PR merge 後だけ `Done` 相当へ移動する

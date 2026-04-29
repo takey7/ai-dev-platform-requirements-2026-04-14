@@ -189,6 +189,132 @@ class PlatformOrchestratorTests(unittest.TestCase):
         issue["fields"]["status"]["name"] = "Done"
         self.assertFalse(orchestrator.issue_is_auto_ready(issue))
 
+    def test_select_transition_for_status_aliases(self) -> None:
+        transition = orchestrator.select_transition_for_aliases(
+            [
+                {"id": "11", "name": "Start work", "to": {"name": "In Progress"}},
+                {"id": "21", "name": "Finish", "to": {"name": "Done"}},
+            ],
+            ("進行中", "In Progress"),
+        )
+
+        self.assertEqual(transition["id"], "11")
+
+    def test_transition_jira_issue_noops_when_already_target_status(self) -> None:
+        original_status = orchestrator.jira_issue_current_status
+        original_transitions = orchestrator.jira_issue_transitions
+        original_transition = orchestrator.jira_transition_issue
+        try:
+            orchestrator.jira_issue_current_status = lambda _settings, _issue_key: "In Progress"
+            orchestrator.jira_issue_transitions = lambda _settings, _issue_key: (_ for _ in ()).throw(AssertionError())
+            orchestrator.jira_transition_issue = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError())
+
+            result = orchestrator.transition_jira_issue_for_job(
+                SimpleNamespace(),
+                {"issue_key": "BILL-1", "state": "planning", "status_name": "To Do"},
+                orchestrator.default_transition_policy(),
+            )
+        finally:
+            orchestrator.jira_issue_current_status = original_status
+            orchestrator.jira_issue_transitions = original_transitions
+            orchestrator.jira_transition_issue = original_transition
+
+        self.assertFalse(result["transitioned"])
+        self.assertEqual(result["status_name"], "In Progress")
+
+    def test_transition_jira_issue_warns_when_transition_missing(self) -> None:
+        original_status = orchestrator.jira_issue_current_status
+        original_transitions = orchestrator.jira_issue_transitions
+        try:
+            orchestrator.jira_issue_current_status = lambda _settings, _issue_key: "To Do"
+            orchestrator.jira_issue_transitions = lambda _settings, _issue_key: []
+
+            result = orchestrator.transition_jira_issue_for_job(
+                SimpleNamespace(),
+                {"issue_key": "BILL-1", "state": "coding", "status_name": "To Do"},
+                orchestrator.default_transition_policy(),
+            )
+        finally:
+            orchestrator.jira_issue_current_status = original_status
+            orchestrator.jira_issue_transitions = original_transitions
+
+        self.assertFalse(result["transitioned"])
+        self.assertIn("No Jira transition available", result["warning"])
+
+    def test_jira_transition_issue_retries_conflict_once(self) -> None:
+        calls: list[str] = []
+        original_request = orchestrator.jira_request
+        original_sleep = orchestrator.time.sleep
+        try:
+            def fake_request(*_args, **_kwargs):
+                calls.append("call")
+                if len(calls) == 1:
+                    raise orchestrator.JiraRequestError("conflict", status_code=409)
+                return {}
+
+            orchestrator.jira_request = fake_request
+            orchestrator.time.sleep = lambda _seconds: None
+
+            orchestrator.jira_transition_issue(SimpleNamespace(), "BILL-1", "11")
+        finally:
+            orchestrator.jira_request = original_request
+            orchestrator.time.sleep = original_sleep
+
+        self.assertEqual(calls, ["call", "call"])
+
+    def test_desired_transition_keeps_ready_for_merge_in_progress(self) -> None:
+        policy = orchestrator.default_transition_policy()
+
+        self.assertIn("In Progress", orchestrator.desired_status_aliases_for_state("ready_for_merge", policy))
+        self.assertIn("Done", orchestrator.desired_status_aliases_for_state("done", policy))
+        self.assertEqual(orchestrator.desired_status_aliases_for_state("blocked", policy), ())
+
+    def test_launch_agent_plist_contains_restart_contract(self) -> None:
+        plist = orchestrator.build_launch_agent_plist(
+            label="com.example.test",
+            platform_root=Path("/opt/platform"),
+            config_path=Path("/tmp/orchestrator.json"),
+            log_dir=Path("/tmp/logs"),
+        )
+
+        self.assertTrue(plist["RunAtLoad"])
+        self.assertTrue(plist["KeepAlive"])
+        self.assertEqual(
+            plist["ProgramArguments"],
+            [
+                "/opt/platform/bin/platform",
+                "orchestrator",
+                "run",
+                "--poll-only",
+                "--config",
+                "/tmp/orchestrator.json",
+            ],
+        )
+        self.assertEqual(plist["StandardOutPath"], "/tmp/logs/orchestrator.out.log")
+
+    def test_install_and_uninstall_agent_dry_run(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()) as install_output:
+            code = orchestrator.cmd_install_agent(
+                SimpleNamespace(
+                    config="/tmp/orchestrator.json",
+                    label="com.example.test",
+                    platform_root="/opt/platform",
+                    dry_run=True,
+                )
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn("<key>RunAtLoad</key>", install_output.getvalue())
+        self.assertIn("/opt/platform/bin/platform", install_output.getvalue())
+
+        with contextlib.redirect_stdout(io.StringIO()) as uninstall_output:
+            code = orchestrator.cmd_uninstall_agent(
+                SimpleNamespace(label="com.example.test", dry_run=True)
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn("Would unload com.example.test", uninstall_output.getvalue())
+
     def test_discover_projects_scans_multiple_roots(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -296,6 +422,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 repo_name="billing-api",
                 confluence_space="ENG",
                 codex_review_mode="auto_required",
+                transition_policy=orchestrator.default_transition_policy(),
                 manifest_path=Path(tmpdir) / "billing-api" / ".platform" / "platform.yaml",
                 source_repo="takey7/platform",
                 workflow_ref="v0.1.5",
@@ -333,6 +460,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 repo_name="billing-api",
                 confluence_space="ENG",
                 codex_review_mode="auto_required",
+                transition_policy=orchestrator.default_transition_policy(),
                 manifest_path=repo / ".platform" / "platform.yaml",
                 source_repo="takey7/platform",
                 workflow_ref="v0.1.5",
@@ -486,6 +614,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 repo_name="repo",
                 confluence_space="ENG",
                 codex_review_mode="auto_required",
+                transition_policy=orchestrator.default_transition_policy(),
                 manifest_path=repo / ".platform" / "platform.yaml",
                 source_repo="takey7/platform",
                 workflow_ref="v0.1.5",
@@ -535,6 +664,73 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertEqual(refreshed, 1)
             self.assertEqual(job["state"], "blocked")
             self.assertIn("Codex review did not arrive", job["latest_error"])
+
+    def test_poll_github_jobs_transitions_done_only_after_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            project = orchestrator.RepoProject(
+                project_key="BILL",
+                repo_path=repo,
+                repo_name="repo",
+                confluence_space="ENG",
+                codex_review_mode="auto_required",
+                transition_policy=orchestrator.default_transition_policy(),
+                manifest_path=repo / ".platform" / "platform.yaml",
+                source_repo="takey7/platform",
+                workflow_ref="v0.1.5",
+            )
+            store.sync_projects([project])
+            store.enqueue_issue(
+                project_key="BILL",
+                repo_path=str(repo),
+                issue_key="BILL-1",
+                status="In Progress",
+                summary="merged pr",
+            )
+            store.update_job(
+                "BILL-1",
+                state="ready_for_merge",
+                branch="codex/BILL-1-merged",
+                worktree_path=str(repo),
+                pr_number="1",
+            )
+            settings = SimpleNamespace(
+                codex_review_authors=("codex", "codex[bot]"),
+                auto_review_grace_seconds=0,
+                fallback_review_grace_seconds=0,
+            )
+            service = orchestrator.OrchestratorService(settings=settings, store=store)
+            seen_states: list[str] = []
+            original_status = orchestrator.github_pull_request_status
+            original_transition = orchestrator.transition_jira_issue_for_job
+            original_upsert = orchestrator.upsert_summary_comment
+            try:
+                orchestrator.github_pull_request_status = lambda *_args, **_kwargs: {
+                    "number": 1,
+                    "url": "https://github.example/pull/1",
+                    "state": "MERGED",
+                    "headRefOid": "abc123",
+                    "reviews": [],
+                    "statusCheckRollup": [{"conclusion": "SUCCESS"}],
+                }
+                orchestrator.transition_jira_issue_for_job = lambda _settings, job, _policy: (
+                    seen_states.append(job["state"]) or {"transitioned": True, "status_name": "Done"}
+                )
+                orchestrator.upsert_summary_comment = lambda *_args, **_kwargs: "comment-1"
+
+                refreshed = service.poll_github_jobs(issue_key="BILL-1")
+            finally:
+                orchestrator.github_pull_request_status = original_status
+                orchestrator.transition_jira_issue_for_job = original_transition
+                orchestrator.upsert_summary_comment = original_upsert
+
+            job = store.get_job("BILL-1")
+            self.assertEqual(refreshed, 1)
+            self.assertEqual(job["state"], "done")
+            self.assertEqual(job["status_name"], "Done")
+            self.assertEqual(seen_states, ["done"])
 
     def test_status_from_process_marks_timeout_fallback_distinct_from_success(self) -> None:
         self.assertEqual(
@@ -644,6 +840,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 repo_name="billing-api",
                 confluence_space="ENG",
                 codex_review_mode="auto_required",
+                transition_policy=orchestrator.default_transition_policy(),
                 manifest_path=repo / ".platform" / "platform.yaml",
                 source_repo="takey7/platform",
                 workflow_ref="v0.1.5",

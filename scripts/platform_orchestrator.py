@@ -6,6 +6,7 @@ import base64
 import contextlib
 import json
 import os
+import plistlib
 import re
 import secrets
 import shutil
@@ -48,6 +49,9 @@ DEFAULT_CODEX_MODEL = ""
 DEFAULT_CODEX_IGNORE_USER_CONFIG = True
 DEFAULT_CLAUDE_MODEL = "default"
 DEFAULT_CLAUDE_EFFORT = ""
+DEFAULT_TRANSITION_POLICY_MODE = "kanban_minimal"
+DEFAULT_ACTIVE_STATUS_ALIASES = ("In Progress", "進行中", "作業中")
+DEFAULT_DONE_STATUS_ALIASES = ("Done", "完了")
 ATLASSIAN_TOKEN_KEYCHAIN_SERVICE = "ai-dev-platform.atlassian-api-token"
 IGNORED_WORKTREE_PREFIXES = (".tmp/",)
 IGNORED_WORKTREE_PATHS = {
@@ -79,10 +83,27 @@ RUNNABLE_STATES = {
 }
 WAITING_STATES = {"waiting_checks", "waiting_review", "ready_for_merge"}
 TERMINAL_STATES = {"ready_for_merge", "done", "cancelled"}
+ACTIVE_JIRA_TRANSITION_STATES = {
+    "queued",
+    "planning",
+    "coding",
+    "reviewing",
+    "pr_open",
+    "waiting_checks",
+    "waiting_review",
+    "ready_for_merge",
+}
+LAUNCH_AGENT_LABEL = "com.ai-dev-platform.orchestrator"
 
 
 class OrchestratorError(RuntimeError):
     pass
+
+
+class JiraRequestError(OrchestratorError):
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -92,6 +113,7 @@ class RepoProject:
     repo_name: str
     confluence_space: str
     codex_review_mode: str
+    transition_policy: dict[str, Any]
     manifest_path: Path
     source_repo: str
     workflow_ref: str
@@ -353,6 +375,31 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     cancel.add_argument("--issue", required=True, help="Issue key to cancel.")
     cancel.set_defaults(func=cmd_cancel)
 
+    install_agent = orchestrator_subparsers.add_parser(
+        "install-agent",
+        help="Install a macOS LaunchAgent that restarts the polling worker at login.",
+    )
+    install_agent.add_argument("--config", default=None, help="Worker config path to pass to the agent.")
+    install_agent.add_argument("--label", default=LAUNCH_AGENT_LABEL, help="LaunchAgent label.")
+    install_agent.add_argument("--platform-root", default=str(REPO_ROOT), help="Platform source repo path.")
+    install_agent.add_argument("--dry-run", action="store_true", help="Print the plist without writing or loading it.")
+    install_agent.set_defaults(func=cmd_install_agent)
+
+    uninstall_agent = orchestrator_subparsers.add_parser(
+        "uninstall-agent",
+        help="Unload and remove the macOS LaunchAgent.",
+    )
+    uninstall_agent.add_argument("--label", default=LAUNCH_AGENT_LABEL, help="LaunchAgent label.")
+    uninstall_agent.add_argument("--dry-run", action="store_true", help="Print the target plist path without removing it.")
+    uninstall_agent.set_defaults(func=cmd_uninstall_agent)
+
+    agent_status = orchestrator_subparsers.add_parser(
+        "agent-status",
+        help="Show macOS LaunchAgent status for the polling worker.",
+    )
+    agent_status.add_argument("--label", default=LAUNCH_AGENT_LABEL, help="LaunchAgent label.")
+    agent_status.set_defaults(func=cmd_agent_status)
+
 
 def cmd_configure(args: argparse.Namespace) -> int:
     config_path = Path(args.config).expanduser() if args.config else default_config_path()
@@ -596,6 +643,57 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     signal_active_process(store.get_job(issue_key).get("active_pid"))
     print(f"Cancel requested for {issue_key}")
     return 0
+
+
+def cmd_install_agent(args: argparse.Namespace) -> int:
+    platform_root = Path(args.platform_root).expanduser().resolve()
+    plist_path = launch_agent_plist_path(args.label)
+    log_dir = launch_agent_log_dir()
+    config_path = Path(args.config).expanduser().resolve() if args.config else None
+    plist = build_launch_agent_plist(
+        label=args.label,
+        platform_root=platform_root,
+        config_path=config_path,
+        log_dir=log_dir,
+    )
+    if args.dry_run:
+        print(plistlib.dumps(plist, sort_keys=False).decode("utf-8"))
+        return 0
+    if sys.platform != "darwin":
+        raise OrchestratorError("LaunchAgent install is only supported on macOS. Use systemd on Linux.")
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    plist_path.write_bytes(plistlib.dumps(plist, sort_keys=False))
+    unload_launch_agent(args.label, plist_path, ignore_errors=True)
+    run_command(["launchctl", "bootstrap", launchctl_domain(), str(plist_path)])
+    run_command(["launchctl", "kickstart", "-k", f"{launchctl_domain()}/{args.label}"])
+    print(f"Installed LaunchAgent: {plist_path}")
+    return 0
+
+
+def cmd_uninstall_agent(args: argparse.Namespace) -> int:
+    plist_path = launch_agent_plist_path(args.label)
+    if args.dry_run:
+        print(f"Would unload {args.label} and remove {plist_path}")
+        return 0
+    if sys.platform != "darwin":
+        raise OrchestratorError("LaunchAgent uninstall is only supported on macOS.")
+    unload_launch_agent(args.label, plist_path, ignore_errors=True)
+    if plist_path.exists():
+        plist_path.unlink()
+    print(f"Uninstalled LaunchAgent: {plist_path}")
+    return 0
+
+
+def cmd_agent_status(args: argparse.Namespace) -> int:
+    if sys.platform != "darwin":
+        raise OrchestratorError("LaunchAgent status is only supported on macOS.")
+    result = run_optional(["launchctl", "print", f"{launchctl_domain()}/{args.label}"])
+    if result and result.returncode == 0:
+        print(result.stdout.rstrip())
+        return 0
+    print(f"LaunchAgent is not loaded: {args.label}")
+    return 1
 
 
 def update_pause_state(
@@ -863,6 +961,8 @@ class OrchestratorService:
             status=str(issue["fields"]["status"]["name"]),
             summary=str(issue["fields"].get("summary", "")),
         )
+        if not existing_job:
+            self.sync_jira_transition(issue_key)
         return not existing_job
 
     def dispatch_jobs(self) -> None:
@@ -1189,6 +1289,10 @@ class OrchestratorService:
         job = self.store.get_job(issue_key)
         if not job:
             return
+        transition_notice = self.sync_jira_transition(issue_key, job)
+        if transition_notice:
+            extra_notice = "\n".join(item for item in (extra_notice, transition_notice) if item)
+            job = self.store.get_job(issue_key) or job
         comment_body = build_summary_comment(
             job=job,
             checks_summary=checks_summary or latest_step_summary(self.store, issue_key, "waiting_checks"),
@@ -1198,6 +1302,21 @@ class OrchestratorService:
         )
         comment_id = upsert_summary_comment(self.settings, issue_key, comment_body, self.store.report_comment_id(issue_key))
         self.store.upsert_report(issue_key, comment_id, comment_body)
+
+    def sync_jira_transition(self, issue_key: str, job: dict[str, Any] | None = None) -> str:
+        current_job = job or self.store.get_job(issue_key)
+        if not current_job:
+            return ""
+        policy = transition_policy_from_project(self.store.project(str(current_job.get("project_key", ""))))
+        result = transition_jira_issue_for_job(self.settings, current_job, policy)
+        if result.get("status_name"):
+            self.store.update_job(issue_key, status_name=str(result["status_name"]))
+        if result.get("warning"):
+            self.store.record_step(issue_key, "jira_transition", "warning", result)
+            return str(result["warning"])
+        if result.get("transitioned"):
+            self.store.record_step(issue_key, "jira_transition", "success", result)
+        return ""
 
 
 class OrchestratorStore:
@@ -1235,6 +1354,7 @@ class OrchestratorStore:
                     repo_name TEXT NOT NULL,
                     confluence_space TEXT NOT NULL,
                     codex_review_mode TEXT NOT NULL DEFAULT 'auto_required',
+                    transition_policy_json TEXT DEFAULT '{}',
                     manifest_path TEXT NOT NULL,
                     source_repo TEXT NOT NULL,
                     workflow_ref TEXT NOT NULL,
@@ -1319,6 +1439,12 @@ class OrchestratorStore:
             self._ensure_column(
                 connection,
                 "projects",
+                "transition_policy_json",
+                "TEXT DEFAULT '{}'",
+            )
+            self._ensure_column(
+                connection,
+                "projects",
                 "webhook_secret",
                 "TEXT DEFAULT ''",
             )
@@ -1350,13 +1476,14 @@ class OrchestratorStore:
                     """
                     INSERT INTO projects (
                         project_key, repo_path, repo_name, confluence_space, codex_review_mode,
-                        manifest_path, source_repo, workflow_ref, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        transition_policy_json, manifest_path, source_repo, workflow_ref, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(project_key) DO UPDATE SET
                         repo_path=excluded.repo_path,
                         repo_name=excluded.repo_name,
                         confluence_space=excluded.confluence_space,
                         codex_review_mode=excluded.codex_review_mode,
+                        transition_policy_json=excluded.transition_policy_json,
                         manifest_path=excluded.manifest_path,
                         source_repo=excluded.source_repo,
                         workflow_ref=excluded.workflow_ref,
@@ -1368,6 +1495,7 @@ class OrchestratorStore:
                         project.repo_name,
                         project.confluence_space,
                         project.codex_review_mode,
+                        json.dumps(project.transition_policy, ensure_ascii=False),
                         str(project.manifest_path),
                         project.source_repo,
                         project.workflow_ref,
@@ -1901,6 +2029,59 @@ def default_state_dir() -> Path:
     return path
 
 
+def launch_agent_plist_path(label: str = LAUNCH_AGENT_LABEL) -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+
+def launch_agent_log_dir() -> Path:
+    return Path.home() / "Library" / "Logs" / CONFIG_DIRNAME
+
+
+def launchctl_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def build_launch_agent_plist(
+    *,
+    label: str,
+    platform_root: Path,
+    config_path: Path | None,
+    log_dir: Path,
+) -> dict[str, Any]:
+    program_args = [
+        str(platform_root / "bin" / "platform"),
+        "orchestrator",
+        "run",
+        "--poll-only",
+    ]
+    if config_path:
+        program_args.extend(["--config", str(config_path)])
+    return {
+        "Label": label,
+        "ProgramArguments": program_args,
+        "WorkingDirectory": str(platform_root),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(log_dir / "orchestrator.out.log"),
+        "StandardErrorPath": str(log_dir / "orchestrator.err.log"),
+    }
+
+
+def unload_launch_agent(label: str, plist_path: Path, *, ignore_errors: bool) -> None:
+    result = run_optional(["launchctl", "bootout", launchctl_domain(), str(plist_path)])
+    if result and result.returncode == 0:
+        return
+    result = run_optional(["launchctl", "bootout", f"{launchctl_domain()}/{label}"])
+    if result and result.returncode == 0:
+        return
+    if ignore_errors:
+        return
+    message = "Could not unload LaunchAgent"
+    if result and result.stderr.strip():
+        message += f": {result.stderr.strip()}"
+    raise OrchestratorError(message)
+
+
 def default_projects_root() -> str:
     platform_config = load_platform_user_config()
     projects_root = platform_config.get("projects_root")
@@ -1994,6 +2175,9 @@ def load_repo_project(target: Path) -> RepoProject:
             .get("codex_review", {})
             .get("mode", "auto_required")
         ),
+        transition_policy=normalize_transition_policy(
+            manifest.get("integrations", {}).get("atlassian", {}).get("transition_policy")
+        ),
         manifest_path=manifest_path,
         source_repo=str(manifest["integrations"]["github"]["source_repo"]),
         workflow_ref=str(manifest["integrations"]["github"]["workflow_ref"]),
@@ -2005,6 +2189,108 @@ def issue_is_auto_ready(issue: dict[str, Any]) -> bool:
     labels = {str(label).lower() for label in fields.get("labels", [])}
     status = str(fields.get("status", {}).get("name", ""))
     return START_LABEL.lower() in labels and status in DEFAULT_READY_STATUSES
+
+
+def default_transition_policy() -> dict[str, Any]:
+    return {
+        "mode": DEFAULT_TRANSITION_POLICY_MODE,
+        "active_statuses": list(DEFAULT_ACTIVE_STATUS_ALIASES),
+        "done_statuses": list(DEFAULT_DONE_STATUS_ALIASES),
+    }
+
+
+def normalize_transition_policy(value: Any) -> dict[str, Any]:
+    policy = default_transition_policy()
+    if not isinstance(value, dict):
+        return policy
+    mode = str(value.get("mode", policy["mode"])).strip() or DEFAULT_TRANSITION_POLICY_MODE
+    policy["mode"] = mode
+    for key, defaults in (
+        ("active_statuses", DEFAULT_ACTIVE_STATUS_ALIASES),
+        ("done_statuses", DEFAULT_DONE_STATUS_ALIASES),
+    ):
+        raw = value.get(key, defaults)
+        if isinstance(raw, list):
+            aliases = [str(item).strip() for item in raw if str(item).strip()]
+            if aliases:
+                policy[key] = aliases
+    return policy
+
+
+def transition_policy_from_project(project: dict[str, Any] | None) -> dict[str, Any]:
+    if not project:
+        return default_transition_policy()
+    try:
+        return normalize_transition_policy(json.loads(str(project.get("transition_policy_json") or "{}")))
+    except json.JSONDecodeError:
+        return default_transition_policy()
+
+
+def desired_status_aliases_for_state(state: str, policy: dict[str, Any]) -> tuple[str, ...]:
+    normalized = normalize_transition_policy(policy)
+    if normalized.get("mode") != DEFAULT_TRANSITION_POLICY_MODE:
+        return ()
+    if state in ACTIVE_JIRA_TRANSITION_STATES:
+        return tuple(str(item) for item in normalized["active_statuses"])
+    if state == "done":
+        return tuple(str(item) for item in normalized["done_statuses"])
+    return ()
+
+
+def status_name_matches_aliases(status_name: str, aliases: tuple[str, ...]) -> bool:
+    normalized = normalize_status_name(status_name)
+    return any(normalized == normalize_status_name(alias) for alias in aliases)
+
+
+def normalize_status_name(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def select_transition_for_aliases(
+    transitions: list[dict[str, Any]], aliases: tuple[str, ...]
+) -> dict[str, Any] | None:
+    for transition in transitions:
+        to_status = str(transition.get("to", {}).get("name", ""))
+        name = str(transition.get("name", ""))
+        if status_name_matches_aliases(to_status, aliases) or status_name_matches_aliases(name, aliases):
+            return transition
+    return None
+
+
+def transition_jira_issue_for_job(
+    settings: WorkerSettings,
+    job: dict[str, Any],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    aliases = desired_status_aliases_for_state(str(job.get("state", "")), policy)
+    issue_key = str(job.get("issue_key", ""))
+    if not aliases or not issue_key:
+        return {"transitioned": False, "status_name": str(job.get("status_name", ""))}
+    try:
+        current_status = jira_issue_current_status(settings, issue_key)
+        if status_name_matches_aliases(current_status, aliases):
+            return {"transitioned": False, "status_name": current_status}
+        transition = select_transition_for_aliases(jira_issue_transitions(settings, issue_key), aliases)
+        if not transition:
+            return {
+                "transitioned": False,
+                "status_name": current_status,
+                "warning": f"No Jira transition available from `{current_status}` to one of: {', '.join(aliases)}.",
+            }
+        target_status = str(transition.get("to", {}).get("name") or transition.get("name") or aliases[0])
+        jira_transition_issue(settings, issue_key, str(transition["id"]))
+        return {
+            "transitioned": True,
+            "status_name": target_status,
+            "transition_id": str(transition["id"]),
+            "target_status": target_status,
+        }
+    except Exception as exc:
+        return {
+            "transitioned": False,
+            "status_name": str(job.get("status_name", "")),
+            "warning": f"Jira transition warning: {exc}",
+        }
 
 
 def jira_search_auto_issues(settings: WorkerSettings, project_key: str) -> list[dict[str, Any]]:
@@ -2039,6 +2325,39 @@ def jira_get_issue(settings: WorkerSettings, issue_key: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise OrchestratorError(f"Could not fetch Jira issue {issue_key}")
     return payload
+
+
+def jira_issue_current_status(settings: WorkerSettings, issue_key: str) -> str:
+    issue = jira_get_issue(settings, issue_key)
+    return str(issue.get("fields", {}).get("status", {}).get("name", ""))
+
+
+def jira_issue_transitions(settings: WorkerSettings, issue_key: str) -> list[dict[str, Any]]:
+    payload = jira_request(
+        settings=settings,
+        method="GET",
+        path=f"/rest/api/3/issue/{issue_key}/transitions",
+    )
+    transitions = payload.get("transitions", []) if isinstance(payload, dict) else []
+    return [transition for transition in transitions if isinstance(transition, dict)]
+
+
+def jira_transition_issue(settings: WorkerSettings, issue_key: str, transition_id: str) -> None:
+    payload = {"transition": {"id": transition_id}}
+    for attempt in range(2):
+        try:
+            jira_request(
+                settings=settings,
+                method="POST",
+                path=f"/rest/api/3/issue/{issue_key}/transitions",
+                payload=payload,
+            )
+            return
+        except JiraRequestError as exc:
+            if exc.status_code == HTTPStatus.CONFLICT and attempt == 0:
+                time.sleep(1)
+                continue
+            raise
 
 
 def jira_issue_comments(settings: WorkerSettings, issue_key: str) -> list[dict[str, Any]]:
@@ -2196,7 +2515,10 @@ def jira_request_raw(
             return json.loads(content)
     except error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise OrchestratorError(f"Jira request failed ({method} {path}): {exc.code} {body}") from exc
+        raise JiraRequestError(
+            f"Jira request failed ({method} {path}): {exc.code} {body}",
+            status_code=exc.code,
+        ) from exc
 
 
 def jira_cloud_id(settings: WorkerSettings) -> str:

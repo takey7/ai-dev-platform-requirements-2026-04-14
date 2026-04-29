@@ -40,7 +40,7 @@ export PROJECTS_ROOT="$HOME/workspaces"
 
 export GITHUB_OWNER="takey7"
 export PLATFORM_SOURCE_REPO="takey7/ai-dev-platform-requirements-2026-04-14"
-export PLATFORM_VERSION="v0.1.11"
+export PLATFORM_VERSION="v0.1.12"
 
 export JIRA_SITE_URL="https://ssbot.atlassian.net"
 export JIRA_ADMIN_EMAIL="YOUR_ATLASSIAN_ADMIN_EMAIL@example.com"
@@ -257,6 +257,8 @@ worker が polling で issue を拾うと、自動で次を進めます。
 - GitHub checks 待ち
 - Codex review artifact 待ち
 - Jira sticky comment 更新
+- 作業開始時に Jira status を `In Progress` / `進行中` / `作業中` へ移動
+- PR merge 後だけ Jira status を `Done` / `完了` へ移動
 
 状態を確認します。
 
@@ -305,6 +307,7 @@ cd "$PLATFORM_SOURCE"
 - required checks が success
 - `chatgpt-codex-connector` の review、または `Codex Review:` artifact がある
 - Jira sticky comment に state / branch / PR URL / checks / review が書き戻される
+- Jira は `ready_for_merge` では Done にならず、PR merge 後だけ Done になる
 - worker は `ready_for_merge` で止まる
 
 merge は v1 では自動実行しません。人間または GitHub rules / merge queue に任せます。

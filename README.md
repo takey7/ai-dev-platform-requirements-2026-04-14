@@ -141,8 +141,18 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
 - repo ごとに 1 issue だけ lease を取る
 - `ai:auto` + ready status (`To Do`, `Selected for Development`) の issue を対象にする
 - Jira comments を polling し、`/ai pause`, `/ai resume`, `/ai cancel`, `/ai retry`, `/ai status` を処理する
+- 作業開始時に Jira を `In Progress` / `進行中` / `作業中` へ best-effort transition する
+- PR merge 後だけ Jira を `Done` / `完了` へ best-effort transition する
 - `ready_for_merge` で停止し、merge は人か既存 GitHub ルールに委ねる
 - public HTTPS URL が必要なのは webhook mode を明示した場合だけ
+
+macOS ローカルでログイン時に worker を自動再起動したい場合:
+```bash
+./bin/platform orchestrator install-agent
+./bin/platform orchestrator agent-status
+```
+
+Linux 固定 worker では `deploy/orchestrator/platform-orchestrator.service` を使います。
 
 ### 10. GitHub/Codex review を確認する
 ```bash
@@ -285,7 +295,7 @@ base 層は stack-neutral を維持し、Node 前提の実装は `scaffolds/adap
 
 ### resident orchestrator v1
 - 人間と Claude/Codex の通常開発では、引き続き repo-scoped MCP + OAuth を標準にする
-- resident orchestrator は Jira event / control / sticky comment のために Jira REST を使う
+- resident orchestrator は Jira event / control / sticky comment / status transition のために Jira REST を使う
 - `Claude` と `Codex` は直接会話させず、worker が structured payload で baton pass する
 - Jira の主経路は polling-first。worker が repo manifest の Jira project key ごとに Jira REST を polling する
 - webhook mode は optional。project-scoped Automation rule + `Send web request` は低遅延が必要な場合だけ使う
