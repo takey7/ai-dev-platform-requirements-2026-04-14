@@ -93,6 +93,7 @@ cat ~/.config/ai-dev-platform/orchestrator.json
 - `jira_site_url`
 - `jira_admin_email`
 - `ai.codex_model`: 既定は空文字。Codex CLI の組み込み current default に追従する
+- `ai.codex_binary`: 既定は `auto`。互換済み Codex CLI を toolchain contract から使う
 - `ai.codex_ignore_user_config`: 既定は `true`。worker は個人の `~/.codex/config.toml` を読まない
 - `ai.claude_model`: 既定 `default`
 - `ai.claude_effort`: 既定は空文字で Claude Code の既定に委ねる
@@ -101,12 +102,15 @@ cat ~/.config/ai-dev-platform/orchestrator.json
 ```bash
 ./bin/platform orchestrator configure \
   --codex-model "" \
+  --codex-binary auto \
   --codex-ignore-user-config \
   --claude-model default \
   --claude-effort ""
+
+./bin/platform toolchain doctor
 ```
 
-Codex を固定したい専用 worker では `--codex-model gpt-5.5 --codex-ignore-user-config` を使います。
+Codex binary を固定したい専用 worker では `./bin/platform toolchain pin-codex --binary <path>` を使います。
 
 専用 worker の OS ユーザー設定をあえて継承したい場合だけ `--codex-use-user-config` を使います。
 

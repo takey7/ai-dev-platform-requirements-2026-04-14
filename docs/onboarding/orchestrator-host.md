@@ -84,14 +84,21 @@ Use the CLI to keep polling mode explicit:
   --bind-host 127.0.0.1 \
   --bind-port 8787 \
   --codex-model "" \
+  --codex-binary auto \
   --codex-ignore-user-config \
   --claude-model default \
   --claude-effort ""
 ```
 
-Empty `--codex-model` tracks the Codex CLI built-in current default. Worker Codex subprocesses ignore `~/.codex/config.toml` by default so a personal model pin such as `model = "gpt-5.2"` cannot silently change production worker behavior. Use `--codex-use-user-config` only for a dedicated worker account where that inheritance is intentional.
+Verify the worker Codex binary before starting the worker:
 
-Use `--codex-model gpt-5.5 --codex-ignore-user-config` only when the worker intentionally pins Codex.
+```bash
+./bin/platform toolchain doctor
+```
+
+Empty `--codex-model` tracks the Codex CLI built-in current default. `--codex-binary auto` resolves a compatible Codex CLI into `~/.config/ai-dev-platform/toolchain.json`, so worker subprocesses do not depend on tmux, LaunchAgent, systemd, or shell PATH order. Worker Codex subprocesses ignore `~/.codex/config.toml` by default so a personal model pin such as `model = "gpt-5.2"` cannot silently change production worker behavior. Use `--codex-use-user-config` only for a dedicated worker account where that inheritance is intentional.
+
+Use `platform toolchain pin-codex --binary <path>` only when the worker intentionally pins a specific Codex binary.
 
 Use `--claude-model best --claude-effort xhigh` only for a dedicated worker where the project explicitly wants the most capable available Claude model.
 
@@ -116,6 +123,7 @@ Use `--claude-model best --claude-effort xhigh` only for a dedicated worker wher
   },
   "ai": {
     "codex_model": "",
+    "codex_binary": "auto",
     "codex_ignore_user_config": true,
     "claude_model": "default",
     "claude_effort": ""

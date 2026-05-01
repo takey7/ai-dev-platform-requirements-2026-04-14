@@ -40,7 +40,7 @@ export PROJECTS_ROOT="$HOME/workspaces"
 
 export GITHUB_OWNER="takey7"
 export PLATFORM_SOURCE_REPO="takey7/ai-dev-platform-requirements-2026-04-14"
-export PLATFORM_VERSION="v0.1.12"
+export PLATFORM_VERSION="v0.1.13"
 
 export JIRA_SITE_URL="https://ssbot.atlassian.net"
 export JIRA_ADMIN_EMAIL="YOUR_ATLASSIAN_ADMIN_EMAIL@example.com"
@@ -175,18 +175,20 @@ cd "$PLATFORM_SOURCE"
 
 ./bin/platform orchestrator configure \
   --codex-model "" \
+  --codex-binary auto \
   --codex-ignore-user-config \
   --claude-model default \
   --claude-effort ""
 
+./bin/platform toolchain doctor
 ./bin/platform doctor --target "$CONSUMER_REPO"
 ```
 
 polling mode では Jira Automation webhook rule と固定 HTTPS URL は不要です。
 
-Codex は空設定で CLI の組み込み current default に追従します。worker は既定で `~/.codex/config.toml` を読まないため、個人設定の `model = "gpt-5.2"` などに引きずられません。
+Codex は空設定で CLI の組み込み current default に追従します。worker は `~/.config/ai-dev-platform/toolchain.json` の互換済み binary を使うため、tmux / shell / LaunchAgent の PATH 差分や古い `/opt/homebrew/bin/codex` に引きずられません。
 
-Codex を固定したい専用 worker では `--codex-model gpt-5.5 --codex-ignore-user-config` を使います。専用 worker の OS ユーザー設定をあえて継承したい場合だけ `--codex-use-user-config` を使います。
+Codex binary を明示固定したい場合は `./bin/platform toolchain pin-codex --binary <path>` を使います。専用 worker の OS ユーザー設定をあえて継承したい場合だけ `--codex-use-user-config` を使います。
 
 Claude を常に最上位モデルへ寄せたい専用 worker では、`--claude-model best --claude-effort xhigh` に変更します。
 

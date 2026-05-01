@@ -309,6 +309,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     codex_review.set_defaults(func=cmd_codex_review)
 
+    toolchain = subparsers.add_parser(
+        "toolchain",
+        help="Inspect and pin worker toolchain binaries such as Codex CLI.",
+    )
+    toolchain_subparsers = toolchain.add_subparsers(dest="toolchain_command", required=True)
+    toolchain_doctor = toolchain_subparsers.add_parser(
+        "doctor",
+        help="Resolve and validate the Codex CLI used by the worker.",
+    )
+    toolchain_doctor.add_argument(
+        "--codex-binary",
+        default=None,
+        help="Override the Codex binary candidate for this check.",
+    )
+    toolchain_doctor.set_defaults(func=cmd_toolchain_doctor)
+    toolchain_pin = toolchain_subparsers.add_parser(
+        "pin-codex",
+        help="Pin a compatible Codex CLI binary in the worker toolchain contract.",
+    )
+    toolchain_pin.add_argument("--binary", required=True, help="Absolute or user-relative Codex binary path.")
+    toolchain_pin.set_defaults(func=cmd_toolchain_pin_codex)
+
     upgrade = subparsers.add_parser(
         "upgrade", help="Sync platform-managed files and move the repo to a newer platform ref."
     )
@@ -649,6 +671,31 @@ def cmd_codex_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_toolchain_doctor(args: argparse.Namespace) -> int:
+    configured = args.codex_binary or os.environ.get("CODEX_BIN", "") or platform_orchestrator.DEFAULT_CODEX_BINARY
+    result = platform_orchestrator.resolve_codex_toolchain(
+        configured_binary=configured,
+        write=True,
+        require=False,
+    )
+    print(json.dumps({"codex": result}, indent=2, ensure_ascii=False))
+    if not result.get("compatible"):
+        print(
+            "Codex CLI is not compatible. Pin a compatible binary with "
+            "`platform toolchain pin-codex --binary <path>`.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def cmd_toolchain_pin_codex(args: argparse.Namespace) -> int:
+    result = platform_orchestrator.pin_codex_toolchain(args.binary)
+    print(f"Pinned Codex CLI: {result['binary']}")
+    print(json.dumps({"codex": result}, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_upgrade(args: argparse.Namespace) -> int:
     target = Path(args.target).resolve()
     manifest_path = target / ".platform" / "platform.yaml"
@@ -939,6 +986,7 @@ def inspect_target(target: Path) -> tuple[list[str], list[str]]:
             errors.append(f"Required tool not found on PATH: {tool}")
 
     warnings.extend(check_local_auth(adapter))
+    warnings.extend(check_worker_toolchain())
 
     for check_name in REQUIRED_CHECKS:
         workflow_path = target / ".github" / "workflows" / f"{check_name}.yml"
@@ -1126,7 +1174,14 @@ def preflight_create_project(settings: dict[str, Any]) -> None:
     if not claude_payload.get("loggedIn", False):
         raise PlatformCommandError("Claude is not logged in. Run `claude auth login --claudeai`.")
 
-    codex_status = run_optional(["codex", "login", "status"])
+    toolchain = platform_orchestrator.resolve_codex_toolchain(write=True, require=False)
+    if not toolchain.get("compatible"):
+        raise PlatformCommandError(
+            "Compatible Codex CLI was not found. Run `platform toolchain doctor` and "
+            "`platform toolchain pin-codex --binary <compatible-codex>` before create-project."
+        )
+    codex_binary = str(toolchain["binary"])
+    codex_status = run_optional([codex_binary, "login", "status"])
     codex_output = ""
     if codex_status:
         codex_output = f"{codex_status.stdout}\n{codex_status.stderr}".lower()
@@ -1665,13 +1720,18 @@ def check_local_auth(adapter: str) -> list[str]:
     else:
         warnings.append("Claude auth status could not be verified. Run `claude auth status`.")
 
-    codex_status = run_optional(["codex", "login", "status"])
-    if codex_status and codex_status.returncode == 0:
-        codex_output = f"{codex_status.stdout}\n{codex_status.stderr}".lower()
-        if "logged in" not in codex_output or "chatgpt" not in codex_output:
-            warnings.append("Codex is not using ChatGPT login. Run `codex logout` then `codex login`.")
+    toolchain = platform_orchestrator.resolve_codex_toolchain(write=True, require=False)
+    if toolchain.get("compatible"):
+        codex_binary = str(toolchain["binary"])
+        codex_status = run_optional([codex_binary, "login", "status"])
+        if codex_status and codex_status.returncode == 0:
+            codex_output = f"{codex_status.stdout}\n{codex_status.stderr}".lower()
+            if "logged in" not in codex_output or "chatgpt" not in codex_output:
+                warnings.append("Codex is not using ChatGPT login. Run `codex logout` then `codex login`.")
+        else:
+            warnings.append(f"Codex login status could not be verified. Run `{codex_binary} login status`.")
     else:
-        warnings.append("Codex login status could not be verified. Run `codex login status`.")
+        warnings.append("Codex login status could not be verified because no compatible Codex CLI was resolved.")
 
     if adapter == "node-ts" and os.environ.get("OPENAI_API_KEY"):
         warnings.append(
@@ -1679,6 +1739,17 @@ def check_local_auth(adapter: str) -> list[str]:
         )
 
     return warnings
+
+
+def check_worker_toolchain() -> list[str]:
+    result = platform_orchestrator.resolve_codex_toolchain(write=True, require=False)
+    if result.get("compatible"):
+        return []
+    return [
+        "Worker Codex toolchain is not compatible. "
+        f"Reason: {result.get('reason') or 'unknown'}. "
+        "Run `platform toolchain doctor` and pin a compatible binary if needed."
+    ]
 
 
 def run_optional(

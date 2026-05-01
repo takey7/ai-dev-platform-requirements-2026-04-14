@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import importlib.util
 import json
 import sys
@@ -318,6 +320,23 @@ class PlatformCliTests(unittest.TestCase):
         )
 
         self.assertEqual(warnings, [])
+
+    def test_toolchain_doctor_reports_resolved_codex(self) -> None:
+        original_resolve = platform.platform_orchestrator.resolve_codex_toolchain
+        try:
+            platform.platform_orchestrator.resolve_codex_toolchain = lambda **_kwargs: {
+                "binary": "/tmp/codex",
+                "version": "codex-cli 0.125.0",
+                "compatible": True,
+                "capabilities": {"--ignore-user-config": True},
+            }
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                code = platform.cmd_toolchain_doctor(SimpleNamespace(codex_binary=None))
+        finally:
+            platform.platform_orchestrator.resolve_codex_toolchain = original_resolve
+
+        self.assertEqual(code, 0)
+        self.assertIn("/tmp/codex", output.getvalue())
 
     def test_orchestrator_registration_missing_warns(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

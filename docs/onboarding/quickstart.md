@@ -94,14 +94,17 @@ cd ai-dev-platform-requirements-2026-04-14
 
 ./bin/platform orchestrator configure \
   --codex-model "" \
+  --codex-binary auto \
   --codex-ignore-user-config \
   --claude-model default \
   --claude-effort ""
+
+./bin/platform toolchain doctor
 ```
 
 This updates `~/.config/ai-dev-platform/orchestrator.json`, creates or reuses the Jira control issue, and registers the repo for polling-first orchestration.
 
-The worker ignores `~/.codex/config.toml` by default. Empty `--codex-model` means the Codex CLI built-in current default, not a personal model pin in the OS user's config.
+The worker uses `~/.config/ai-dev-platform/toolchain.json` to select a compatible Codex CLI by absolute path. Empty `--codex-model` means the Codex CLI built-in current default, not a personal model pin in the OS user's config.
 
 Webhook mode is optional. Only use it when you intentionally want Jira Automation callbacks:
 

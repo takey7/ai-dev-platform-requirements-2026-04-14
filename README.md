@@ -209,14 +209,19 @@ Worker model settings can be changed without editing repo manifests:
 ```bash
 ./bin/platform orchestrator configure \
   --codex-model "" \
+  --codex-binary auto \
   --codex-ignore-user-config \
   --claude-model default \
   --claude-effort ""
+
+./bin/platform toolchain doctor
 ```
 
-To pin Codex explicitly instead of tracking the CLI default:
+The worker stores the compatible Codex CLI path in `~/.config/ai-dev-platform/toolchain.json`, so tmux, LaunchAgent, systemd, and shell PATH differences do not select an old binary.
+
+To pin a Codex binary explicitly:
 ```bash
-./bin/platform orchestrator configure --codex-model gpt-5.5 --codex-ignore-user-config
+./bin/platform toolchain pin-codex --binary ~/.local/bin/codex
 ```
 
 Only use `--codex-use-user-config` when a dedicated worker intentionally wants to inherit that OS user's `~/.codex/config.toml`.

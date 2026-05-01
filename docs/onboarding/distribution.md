@@ -48,6 +48,7 @@
 
 ## Orchestrator rollout checklist
 - register each consuming repo with `platform orchestrator register --target <repo>`
+- run `platform toolchain doctor` before starting the worker
 - run `platform orchestrator run --poll-only`
 - for local macOS always-on use `platform orchestrator install-agent`; for Linux worker hosts use the bundled systemd unit
 - run the worker under a dedicated account already logged into `gh`, `claude`, and `codex`

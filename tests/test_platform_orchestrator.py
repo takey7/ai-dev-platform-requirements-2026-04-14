@@ -71,6 +71,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 jira_site_url="ssbot.atlassian.net",
                 jira_admin_email="admin@example.com",
                 codex_model="gpt-5.5",
+                codex_binary="auto",
                 codex_use_user_config=False,
                 codex_ignore_user_config=True,
                 claude_model="best",
@@ -86,6 +87,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertIn(str(project_root.resolve()), payload["projects_roots"])
             self.assertEqual(payload["jira_site_url"], "https://ssbot.atlassian.net")
             self.assertEqual(payload["ai"]["codex_model"], "gpt-5.5")
+            self.assertEqual(payload["ai"]["codex_binary"], "auto")
             self.assertTrue(payload["ai"]["codex_ignore_user_config"])
             self.assertEqual(payload["ai"]["claude_model"], "best")
             self.assertEqual(payload["ai"]["claude_effort"], "xhigh")
@@ -188,6 +190,84 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertTrue(orchestrator.issue_is_auto_ready(issue))
         issue["fields"]["status"]["name"] = "Done"
         self.assertFalse(orchestrator.issue_is_auto_ready(issue))
+
+    def test_codex_toolchain_rejects_old_cli_without_required_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            binary = Path(tmpdir) / "codex"
+            binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            binary.chmod(0o755)
+            original_probe = orchestrator.run_probe
+            try:
+                def fake_probe(argv):
+                    if argv[-1] == "--version":
+                        return SimpleNamespace(returncode=0, stdout="codex-cli 0.91.0\n", stderr="")
+                    return SimpleNamespace(returncode=0, stdout="Usage: codex exec [OPTIONS]\n", stderr="")
+
+                orchestrator.run_probe = fake_probe
+                result = orchestrator.inspect_codex_binary(str(binary))
+            finally:
+                orchestrator.run_probe = original_probe
+
+        self.assertFalse(result["compatible"])
+        self.assertIn("version below", result["reason"])
+
+    def test_codex_toolchain_accepts_cli_with_required_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            binary = Path(tmpdir) / "codex"
+            binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            binary.chmod(0o755)
+            original_probe = orchestrator.run_probe
+            try:
+                def fake_probe(argv):
+                    if argv[-1] == "--version":
+                        return SimpleNamespace(returncode=0, stdout="codex-cli 0.125.0\n", stderr="")
+                    help_text = " ".join(orchestrator.REQUIRED_CODEX_EXEC_FLAGS)
+                    return SimpleNamespace(returncode=0, stdout=help_text, stderr="")
+
+                orchestrator.run_probe = fake_probe
+                result = orchestrator.inspect_codex_binary(str(binary))
+            finally:
+                orchestrator.run_probe = original_probe
+
+        self.assertTrue(result["compatible"])
+
+    def test_codex_resolver_prefers_local_over_homebrew_old_cli(self) -> None:
+        original_candidates = orchestrator.codex_candidate_paths
+        original_inspect = orchestrator.inspect_codex_binary
+        original_save = orchestrator.save_toolchain_config
+        try:
+            orchestrator.codex_candidate_paths = lambda _configured: [
+                ("/opt/homebrew/bin/codex", "path"),
+                ("/Users/jin/.local/bin/codex", "default-local"),
+            ]
+
+            def fake_inspect(path):
+                return {
+                    "binary": path,
+                    "version": "codex-cli 0.91.0" if "homebrew" in path else "codex-cli 0.125.0",
+                    "capabilities": {flag: "homebrew" not in path for flag in orchestrator.REQUIRED_CODEX_EXEC_FLAGS},
+                    "compatible": "homebrew" not in path,
+                    "reason": "" if "homebrew" not in path else "version below 0.125.0",
+                }
+
+            orchestrator.inspect_codex_binary = fake_inspect
+            orchestrator.save_toolchain_config = lambda _payload: None
+            result = orchestrator.resolve_codex_toolchain(write=True)
+        finally:
+            orchestrator.codex_candidate_paths = original_candidates
+            orchestrator.inspect_codex_binary = original_inspect
+            orchestrator.save_toolchain_config = original_save
+
+        self.assertEqual(result["binary"], "/Users/jin/.local/bin/codex")
+
+    def test_classify_codex_cli_incompatible_argument_error(self) -> None:
+        payload = {
+            "stderr": "error: unexpected argument '--ignore-user-config' found",
+            "stdout": "",
+            "summary": "",
+        }
+
+        self.assertEqual(orchestrator.classify_codex_cli_failure(payload), "codex_cli_incompatible")
 
     def test_select_transition_for_status_aliases(self) -> None:
         transition = orchestrator.select_transition_for_aliases(
@@ -597,11 +677,55 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertIsNone(job["active_pid"])
             self.assertEqual(job["requested_action"], "")
 
+    def test_retry_issue_job_requeues_failed_job_and_releases_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.enqueue_issue(
+                project_key="BILL",
+                repo_path="/tmp/billing-api",
+                issue_key="BILL-1",
+                status="To Do",
+                summary="retry me",
+            )
+            store.update_job("BILL-1", state="failed", latest_error="bad codex", active_pid=None)
+            store.acquire_lease("/tmp/billing-api", "BILL-1")
+
+            orchestrator.retry_issue_job(store, "BILL-1", reason="test")
+
+            job = store.get_job("BILL-1")
+            self.assertEqual(job["state"], "queued")
+            self.assertEqual(job["latest_error"], "")
+            self.assertIsNone(job["active_pid"])
+            self.assertTrue(store.acquire_lease("/tmp/billing-api", "BILL-2"))
+
     def test_status_hints_warn_when_waiting_without_refresh(self) -> None:
         hints = orchestrator.status_hints([{"state": "waiting_checks"}], refreshed=False)
 
         self.assertTrue(hints)
         self.assertEqual(orchestrator.status_hints([{"state": "waiting_checks"}], refreshed=True), [])
+
+    def test_status_hints_warn_when_recorded_worker_source_is_stale(self) -> None:
+        hints = orchestrator.status_hints(
+            [],
+            refreshed=False,
+            worker_event={
+                "payload": {
+                    "source_repo": "/Users/jin/Downloads/ai-dev-platform-requirements-2026-04-14-v0.1.11"
+                }
+            },
+        )
+
+        self.assertTrue(any("v0.1.13" in hint for hint in hints))
+
+    def test_latest_worker_event_decodes_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.record_worker_event("toolchain", {"source_repo": "/tmp/platform", "codex_binary": "/tmp/codex"})
+
+            event = store.latest_worker_event("toolchain")
+
+            self.assertEqual(event["event_type"], "toolchain")
+            self.assertEqual(event["payload"]["source_repo"], "/tmp/platform")
 
     def test_poll_github_jobs_blocks_when_codex_review_never_arrives(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -958,14 +1082,20 @@ class PlatformOrchestratorTests(unittest.TestCase):
             original_communicate = orchestrator.communicate_or_terminate
             original_changed = orchestrator.git_changed_files
             original_summarize = orchestrator.summarize_codex_jsonl
+            original_resolve = orchestrator.resolve_codex_toolchain
             try:
                 orchestrator.start_process = fake_start_process
                 orchestrator.communicate_or_terminate = lambda _process, *, timeout_seconds: ("", "", False)
                 orchestrator.git_changed_files = lambda _path: []
                 orchestrator.summarize_codex_jsonl = lambda _stdout: "ok"
+                orchestrator.resolve_codex_toolchain = lambda **_kwargs: {
+                    "binary": "/tmp/codex",
+                    "version": "codex-cli 0.125.0",
+                    "compatible": True,
+                }
                 result = orchestrator.run_codex_exec(
                     store,
-                    SimpleNamespace(codex_model="gpt-5.5", codex_ignore_user_config=True),
+                    SimpleNamespace(codex_model="gpt-5.5", codex_binary="auto", codex_ignore_user_config=True),
                     Path(tmpdir),
                     "BILL",
                     "BILL-1",
@@ -977,8 +1107,10 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 orchestrator.communicate_or_terminate = original_communicate
                 orchestrator.git_changed_files = original_changed
                 orchestrator.summarize_codex_jsonl = original_summarize
+                orchestrator.resolve_codex_toolchain = original_resolve
 
         self.assertEqual(result["status"], "success")
+        self.assertEqual(captured["argv"][0], "/tmp/codex")
         self.assertIn("--ignore-user-config", captured["argv"])
         self.assertIn("--model", captured["argv"])
         self.assertIn("gpt-5.5", captured["argv"])
@@ -1004,15 +1136,21 @@ class PlatformOrchestratorTests(unittest.TestCase):
             original_changed = orchestrator.git_changed_files
             original_stage = orchestrator.stage_meaningful_changes
             original_summarize = orchestrator.summarize_codex_jsonl
+            original_resolve = orchestrator.resolve_codex_toolchain
             try:
                 orchestrator.start_process = fake_start_process
                 orchestrator.communicate_or_terminate = lambda _process, *, timeout_seconds: ("", "", False)
                 orchestrator.git_changed_files = lambda _path: []
                 orchestrator.stage_meaningful_changes = lambda _path: None
                 orchestrator.summarize_codex_jsonl = lambda _stdout: "ok"
+                orchestrator.resolve_codex_toolchain = lambda **_kwargs: {
+                    "binary": "/tmp/codex",
+                    "version": "codex-cli 0.125.0",
+                    "compatible": True,
+                }
                 result = orchestrator.run_codex_review(
                     store,
-                    SimpleNamespace(codex_model="gpt-5.5", codex_ignore_user_config=True),
+                    SimpleNamespace(codex_model="gpt-5.5", codex_binary="auto", codex_ignore_user_config=True),
                     "BILL-1",
                     Path(tmpdir),
                 )
@@ -1022,10 +1160,83 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 orchestrator.git_changed_files = original_changed
                 orchestrator.stage_meaningful_changes = original_stage
                 orchestrator.summarize_codex_jsonl = original_summarize
+                orchestrator.resolve_codex_toolchain = original_resolve
 
         self.assertEqual(result["status"], "success")
-        self.assertEqual(captured["argv"][:5], ["codex", "exec", "--ignore-user-config", "--model", "gpt-5.5"])
+        self.assertEqual(captured["argv"][:5], ["/tmp/codex", "exec", "--ignore-user-config", "--model", "gpt-5.5"])
         self.assertIn("review", captured["argv"])
+
+    def test_run_codex_exec_recovers_from_incompatible_cli_once(self) -> None:
+        calls: list[str] = []
+
+        class FakeProcess:
+            def __init__(self, binary: str) -> None:
+                self.pid = 123
+                self.binary = binary
+                self.returncode = 2 if "old" in binary else 0
+
+        def fake_resolve(**kwargs):
+            excluded = tuple(kwargs.get("exclude_binaries", ()))
+            if not excluded:
+                return {"binary": "/tmp/old-codex", "version": "codex-cli 0.91.0", "compatible": True}
+            return {"binary": "/tmp/new-codex", "version": "codex-cli 0.125.0", "compatible": True}
+
+        def fake_start_process(argv, *, cwd):
+            calls.append(argv[0])
+            return FakeProcess(argv[0])
+
+        def fake_communicate(process, *, timeout_seconds):
+            if "old" in process.binary:
+                return "", "error: unexpected argument '--ignore-user-config' found", False
+            return "", "", False
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.enqueue_issue(
+                project_key="BILL",
+                repo_path=tmpdir,
+                issue_key="BILL-1",
+                status="To Do",
+                summary="recover test",
+            )
+            original_start = orchestrator.start_process
+            original_communicate = orchestrator.communicate_or_terminate
+            original_changed = orchestrator.git_changed_files
+            original_summarize = orchestrator.summarize_codex_jsonl
+            original_resolve = orchestrator.resolve_codex_toolchain
+            original_inspect = orchestrator.inspect_codex_binary
+            try:
+                orchestrator.start_process = fake_start_process
+                orchestrator.communicate_or_terminate = fake_communicate
+                orchestrator.git_changed_files = lambda _path: ["src/index.ts"]
+                orchestrator.summarize_codex_jsonl = lambda _stdout: "ok"
+                orchestrator.resolve_codex_toolchain = fake_resolve
+                orchestrator.inspect_codex_binary = lambda binary: {
+                    "binary": binary,
+                    "version": "codex-cli 0.125.0" if "new" in binary else "codex-cli 0.91.0",
+                    "compatible": True,
+                }
+                result = orchestrator.run_codex_exec(
+                    store,
+                    SimpleNamespace(codex_model="", codex_binary="auto", codex_ignore_user_config=True),
+                    Path(tmpdir),
+                    "BILL",
+                    "BILL-1",
+                    "codex/BILL-1-test",
+                    {"goal": "test"},
+                )
+            finally:
+                orchestrator.start_process = original_start
+                orchestrator.communicate_or_terminate = original_communicate
+                orchestrator.git_changed_files = original_changed
+                orchestrator.summarize_codex_jsonl = original_summarize
+                orchestrator.resolve_codex_toolchain = original_resolve
+                orchestrator.inspect_codex_binary = original_inspect
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls, ["/tmp/old-codex", "/tmp/new-codex"])
+        self.assertEqual(result["toolchain_recovery"]["previous_binary"], "/tmp/old-codex")
+        self.assertEqual(result["toolchain_recovery"]["recovered_binary"], "/tmp/new-codex")
 
     def _git(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

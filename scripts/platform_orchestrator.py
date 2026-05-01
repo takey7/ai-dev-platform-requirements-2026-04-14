@@ -46,6 +46,7 @@ DEFAULT_CLAUDE_TIMEOUT_SECONDS = 300
 DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 120
 DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS = 60
 DEFAULT_CODEX_MODEL = ""
+DEFAULT_CODEX_BINARY = "auto"
 DEFAULT_CODEX_IGNORE_USER_CONFIG = True
 DEFAULT_CLAUDE_MODEL = "default"
 DEFAULT_CLAUDE_EFFORT = ""
@@ -59,6 +60,7 @@ IGNORED_WORKTREE_PATHS = {
 }
 ORCHESTRATOR_CONFIG_FILENAME = "orchestrator.json"
 PLATFORM_CONFIG_FILENAME = "config.json"
+TOOLCHAIN_CONFIG_FILENAME = "toolchain.json"
 CONFIG_DIRNAME = "ai-dev-platform"
 DB_FILENAME = "orchestrator.db"
 SUMMARY_MARKER = "<!-- platform-orchestrator:summary -->"
@@ -94,6 +96,20 @@ ACTIVE_JIRA_TRANSITION_STATES = {
     "ready_for_merge",
 }
 LAUNCH_AGENT_LABEL = "com.ai-dev-platform.orchestrator"
+MIN_CODEX_VERSION = (0, 125, 0)
+REQUIRED_CODEX_EXEC_FLAGS = (
+    "--ignore-user-config",
+    "--output-schema",
+    "--output-last-message",
+    "--cd",
+    "--json",
+)
+CODEX_CLI_INCOMPATIBLE_PATTERNS = (
+    "unexpected argument '--ignore-user-config'",
+    "unknown option",
+    "requires a newer version of codex",
+    "no such file or directory",
+)
 
 
 class OrchestratorError(RuntimeError):
@@ -134,6 +150,10 @@ class WorkerSettings:
     auto_review_grace_seconds: int
     fallback_review_grace_seconds: int
     codex_model: str
+    codex_binary: str
+    codex_resolved_binary: str
+    codex_resolved_version: str
+    codex_toolchain_compatible: bool
     codex_ignore_user_config: bool
     claude_model: str
     claude_effort: str
@@ -206,6 +226,11 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
         "--codex-model",
         default=None,
         help="Codex CLI model for worker coding/review stages. Use empty string to defer to Codex defaults.",
+    )
+    configure.add_argument(
+        "--codex-binary",
+        default=None,
+        help="Codex CLI binary for worker coding/review stages. Use `auto` to resolve from the toolchain contract.",
     )
     configure.add_argument(
         "--codex-use-user-config",
@@ -375,6 +400,14 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     cancel.add_argument("--issue", required=True, help="Issue key to cancel.")
     cancel.set_defaults(func=cmd_cancel)
 
+    retry = orchestrator_subparsers.add_parser(
+        "retry",
+        help="Requeue a failed or blocked issue from the last successful checkpoint.",
+    )
+    retry.add_argument("--config", default=None, help="Override the worker config path.")
+    retry.add_argument("--issue", required=True, help="Issue key to retry.")
+    retry.set_defaults(func=cmd_retry)
+
     install_agent = orchestrator_subparsers.add_parser(
         "install-agent",
         help="Install a macOS LaunchAgent that restarts the polling worker at login.",
@@ -427,6 +460,7 @@ def cmd_configure(args: argparse.Namespace) -> int:
         config["jira_admin_email"] = args.jira_admin_email
     if (
         args.codex_model is not None
+        or args.codex_binary is not None
         or args.codex_use_user_config
         or args.codex_ignore_user_config
         or args.claude_model is not None
@@ -435,6 +469,8 @@ def cmd_configure(args: argparse.Namespace) -> int:
         ai_config = dict(config.get("ai", {}))
         if args.codex_model is not None:
             ai_config["codex_model"] = args.codex_model.strip()
+        if args.codex_binary is not None:
+            ai_config["codex_binary"] = args.codex_binary.strip() or DEFAULT_CODEX_BINARY
         if args.codex_use_user_config:
             ai_config["codex_ignore_user_config"] = False
         if args.codex_ignore_user_config:
@@ -468,6 +504,20 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     require_runtime_credentials(settings)
     store = OrchestratorStore(settings.db_path)
+    store.record_worker_event(
+        "toolchain",
+        {
+            "codex_binary": settings.codex_resolved_binary,
+            "codex_version": settings.codex_resolved_version,
+            "compatible": settings.codex_toolchain_compatible,
+            "source_repo": str(REPO_ROOT),
+        },
+    )
+    print(
+        "Codex toolchain: "
+        f"{settings.codex_resolved_binary or 'unresolved'} "
+        f"({settings.codex_resolved_version or 'unknown'})"
+    )
     service = OrchestratorService(settings=settings, store=store)
     service.run(once=args.once, enable_http=(not args.no_http and settings.event_mode == "webhook"))
     return 0
@@ -604,10 +654,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         project_key=args.project.upper() if args.project else None,
     )
     flags = store.list_control_flags()
+    worker_event = store.latest_worker_event("toolchain")
     payload = {
         "jobs": rows,
         "control_flags": flags,
-        "hints": status_hints(rows, refreshed=args.refresh),
+        "worker": worker_event,
+        "hints": status_hints(rows, refreshed=args.refresh, settings=settings, worker_event=worker_event),
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
@@ -642,6 +694,15 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     store.set_requested_action(issue_key, "cancel")
     signal_active_process(store.get_job(issue_key).get("active_pid"))
     print(f"Cancel requested for {issue_key}")
+    return 0
+
+
+def cmd_retry(args: argparse.Namespace) -> int:
+    settings = load_worker_settings(config_override=args.config)
+    store = OrchestratorStore(settings.db_path)
+    issue_key = args.issue.upper()
+    retry_issue_job(store, issue_key, reason="operator retry")
+    print(f"Retry queued for {issue_key}")
     return 0
 
 
@@ -730,15 +791,62 @@ def update_pause_state(
     return 0
 
 
-def status_hints(rows: list[dict[str, Any]], *, refreshed: bool) -> list[str]:
+def retry_issue_job(store: "OrchestratorStore", issue_key: str, *, reason: str) -> None:
+    job = store.get_job(issue_key)
+    if not job:
+        raise OrchestratorError(f"Job not found: {issue_key}")
+    if str(job.get("state", "")) not in {"failed", "blocked"}:
+        raise OrchestratorError(f"Job {issue_key} is `{job.get('state')}`; retry is only allowed for failed/blocked jobs.")
+    signal_active_process(job.get("active_pid"))
+    store.release_lease(str(job.get("repo_path", "")), issue_key)
+    store.update_job(
+        issue_key,
+        state="queued",
+        latest_error="",
+        requested_action="",
+        active_pid=None,
+    )
+    store.record_step(
+        issue_key,
+        "retry",
+        "success",
+        {
+            "summary": f"Retry queued: {reason}",
+            "reason": reason,
+            "previous_state": str(job.get("state", "")),
+        },
+    )
+
+
+def status_hints(
+    rows: list[dict[str, Any]],
+    *,
+    refreshed: bool,
+    settings: WorkerSettings | None = None,
+    worker_event: dict[str, Any] | None = None,
+) -> list[str]:
+    hints: list[str] = []
     if refreshed:
-        return []
+        return hints
     if any(str(row.get("state", "")) in WAITING_STATES for row in rows):
-        return [
+        hints.append(
             "Waiting job state may be stale if the worker is not running. "
             "Run `platform orchestrator poll` or `platform orchestrator status --refresh` to refresh GitHub checks/reviews and Jira reporting."
-        ]
-    return []
+        )
+    if settings and not settings.codex_toolchain_compatible:
+        hints.append("Codex toolchain is not compatible. Run `platform toolchain doctor`.")
+    worker_payload = (worker_event or {}).get("payload", {})
+    worker_source_repo = str(worker_payload.get("source_repo", "")) if isinstance(worker_payload, dict) else ""
+    if worker_source_repo and worker_source_repo != str(REPO_ROOT):
+        hints.append(
+            "Last recorded worker source repo differs from this CLI source. "
+            f"Worker: {worker_source_repo}. CLI: {REPO_ROOT}. Restart the worker from the current source repo."
+        )
+    if worker_source_repo.endswith("-v0.1.11"):
+        hints.append(f"Last recorded worker source repo looks stale: {worker_source_repo}. Restart from v0.1.13.")
+    if str(REPO_ROOT).endswith("-v0.1.11"):
+        hints.append(f"Worker source repo looks stale: {REPO_ROOT}. Restart from the v0.1.13 source repo.")
+    return hints
 
 
 class OrchestratorService:
@@ -1069,13 +1177,16 @@ class OrchestratorService:
             self.store.record_step(issue_key, "coding", exec_result["status"], exec_result)
             self.store.update_job(issue_key, latest_commit=git_head(Path(job["worktree_path"])))
             if exec_result["status"] not in {"success", "fallback"}:
+                terminal_state = "blocked" if exec_result["status"] == "blocked" else "failed"
                 self.store.update_job(
                     issue_key,
-                    state="failed",
+                    state=terminal_state,
                     latest_error=exec_result.get("summary", "Codex exec failed"),
                 )
                 self.refresh_issue_report(issue_key)
                 return
+            if exec_result.get("toolchain_recovery"):
+                self.refresh_issue_report(issue_key)
             if not exec_result.get("changed_files"):
                 self.store.update_job(
                     issue_key,
@@ -1100,6 +1211,16 @@ class OrchestratorService:
                 Path(job["worktree_path"]),
             )
             self.store.record_step(issue_key, "reviewing", review_result["status"], review_result)
+            if review_result["status"] == "blocked":
+                self.store.update_job(
+                    issue_key,
+                    state="blocked",
+                    latest_error=review_result.get("summary", "Codex review failed"),
+                )
+                self.refresh_issue_report(issue_key)
+                return
+            if review_result.get("toolchain_recovery"):
+                self.refresh_issue_report(issue_key)
             integrate = run_claude_integrate(
                 self.store,
                 self.settings,
@@ -1293,6 +1414,9 @@ class OrchestratorService:
         if transition_notice:
             extra_notice = "\n".join(item for item in (extra_notice, transition_notice) if item)
             job = self.store.get_job(issue_key) or job
+        recovery_notice = latest_step_summary(self.store, issue_key, "toolchain_recovery")
+        if recovery_notice:
+            extra_notice = "\n".join(item for item in (extra_notice, recovery_notice) if item)
         comment_body = build_summary_comment(
             job=job,
             checks_summary=checks_summary or latest_step_summary(self.store, issue_key, "waiting_checks"),
@@ -1427,6 +1551,12 @@ class OrchestratorStore:
                     issue_key TEXT NOT NULL,
                     command TEXT DEFAULT '',
                     processed_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS worker_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 """
             )
@@ -1570,6 +1700,39 @@ class OrchestratorStore:
                 """,
                 (project_key, issue_key, event_type, json.dumps(payload, ensure_ascii=False), now_iso()),
             )
+
+    def record_worker_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO worker_events (event_type, payload_json, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (event_type, json.dumps(payload, ensure_ascii=False), now_iso()),
+            )
+
+    def latest_worker_event(self, event_type: str = "") -> dict[str, Any]:
+        query = "SELECT * FROM worker_events"
+        params: tuple[Any, ...] = ()
+        if event_type:
+            query += " WHERE event_type = ?"
+            params = (event_type,)
+        query += " ORDER BY created_at DESC, id DESC LIMIT 1"
+        with self._connection() as connection:
+            row = connection.execute(query, params).fetchone()
+        if not row:
+            return {}
+        payload: dict[str, Any]
+        try:
+            decoded = json.loads(str(row["payload_json"]))
+            payload = decoded if isinstance(decoded, dict) else {}
+        except json.JSONDecodeError:
+            payload = {}
+        return {
+            "event_type": str(row["event_type"]),
+            "payload": payload,
+            "created_at": str(row["created_at"]),
+        }
 
     def enqueue_issue(
         self,
@@ -1878,6 +2041,9 @@ def load_worker_settings(
         config["jira_admin_email"] = jira_admin_email
     save_orchestrator_config(config, config_path)
 
+    codex_binary = str(config.get("ai", {}).get("codex_binary", DEFAULT_CODEX_BINARY)).strip() or DEFAULT_CODEX_BINARY
+    codex_toolchain = resolve_codex_toolchain(configured_binary=codex_binary, write=True, require=False)
+
     state_dir = default_state_dir()
     configured_codex_review_authors = tuple(
         str(item).strip().lower()
@@ -1908,6 +2074,10 @@ def load_worker_settings(
             )
         ),
         codex_model=str(config.get("ai", {}).get("codex_model", DEFAULT_CODEX_MODEL)).strip(),
+        codex_binary=codex_binary,
+        codex_resolved_binary=str(codex_toolchain.get("binary", "")),
+        codex_resolved_version=str(codex_toolchain.get("version", "")),
+        codex_toolchain_compatible=bool(codex_toolchain.get("compatible")),
         codex_ignore_user_config=bool(
             config.get("ai", {}).get("codex_ignore_user_config", DEFAULT_CODEX_IGNORE_USER_CONFIG)
         ),
@@ -1993,6 +2163,7 @@ def default_orchestrator_config() -> dict[str, Any]:
         },
         "ai": {
             "codex_model": DEFAULT_CODEX_MODEL,
+            "codex_binary": DEFAULT_CODEX_BINARY,
             "codex_ignore_user_config": DEFAULT_CODEX_IGNORE_USER_CONFIG,
             "claude_model": DEFAULT_CLAUDE_MODEL,
             "claude_effort": DEFAULT_CLAUDE_EFFORT,
@@ -2020,6 +2191,177 @@ def default_config_dir() -> Path:
 
 def default_config_path() -> Path:
     return default_config_dir() / ORCHESTRATOR_CONFIG_FILENAME
+
+
+def default_toolchain_path() -> Path:
+    return default_config_dir() / TOOLCHAIN_CONFIG_FILENAME
+
+
+def load_toolchain_config(path: Path | None = None) -> dict[str, Any]:
+    toolchain_path = path or default_toolchain_path()
+    if not toolchain_path.exists():
+        return {}
+    try:
+        payload = json.loads(toolchain_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_toolchain_config(payload: dict[str, Any], path: Path | None = None) -> None:
+    toolchain_path = path or default_toolchain_path()
+    toolchain_path.parent.mkdir(parents=True, exist_ok=True)
+    toolchain_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def pin_codex_toolchain(binary: str) -> dict[str, Any]:
+    result = inspect_codex_binary(str(Path(binary).expanduser()))
+    if not result.get("compatible"):
+        raise OrchestratorError(f"Codex binary is not compatible: {binary} ({result.get('reason')})")
+    result["pinned"] = True
+    result["source"] = "pin"
+    payload = {"version": 1, "codex": result}
+    save_toolchain_config(payload)
+    return result
+
+
+def resolve_codex_toolchain(
+    *,
+    configured_binary: str = DEFAULT_CODEX_BINARY,
+    write: bool = False,
+    require: bool = True,
+    exclude_binaries: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    excluded = {str(Path(item).expanduser().resolve()) for item in exclude_binaries if item}
+    last_result: dict[str, Any] = {}
+    for candidate, source in codex_candidate_paths(configured_binary):
+        result = inspect_codex_binary(candidate)
+        result["source"] = source
+        if result.get("binary"):
+            binary_key = str(Path(str(result["binary"])).expanduser().resolve())
+            if binary_key in excluded:
+                result["compatible"] = False
+                result["reason"] = "excluded after failed attempt"
+        last_result = result
+        if result.get("compatible"):
+            result["resolved_at"] = now_iso()
+            if write:
+                save_toolchain_config({"version": 1, "codex": result})
+            return result
+    if require:
+        reason = last_result.get("reason") or "No compatible Codex CLI found."
+        raise OrchestratorError(f"No compatible Codex CLI found: {reason}")
+    return {
+        "binary": "",
+        "version": "",
+        "capabilities": {},
+        "compatible": False,
+        "reason": last_result.get("reason") or "No compatible Codex CLI found.",
+        "resolved_at": now_iso(),
+    }
+
+
+def codex_candidate_paths(configured_binary: str = DEFAULT_CODEX_BINARY) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    env_binary = os.environ.get("CODEX_BIN", "").strip()
+    if env_binary:
+        candidates.append((env_binary, "env"))
+    if configured_binary and configured_binary != DEFAULT_CODEX_BINARY:
+        candidates.append((configured_binary, "config"))
+    configured = load_toolchain_config().get("codex", {})
+    if isinstance(configured, dict) and configured.get("binary"):
+        source = "pin" if configured.get("pinned") else "contract"
+        candidates.append((str(configured["binary"]), source))
+    candidates.append((str(Path.home() / ".local" / "bin" / "codex"), "default-local"))
+    nvm_root = Path.home() / ".nvm" / "versions" / "node"
+    if nvm_root.exists():
+        for path in sorted(nvm_root.glob("*/bin/codex"), reverse=True):
+            candidates.append((str(path), "nvm"))
+    candidates.append(("/Applications/Codex.app/Contents/Resources/codex", "codex-app"))
+    for path_dir in os.get_exec_path():
+        if not path_dir:
+            continue
+        candidates.append((str(Path(path_dir) / "codex"), "path"))
+    return dedupe_candidates(candidates)
+
+
+def dedupe_candidates(candidates: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    seen: set[str] = set()
+    result: list[tuple[str, str]] = []
+    for candidate, source in candidates:
+        resolved = str(Path(candidate).expanduser())
+        key = str(Path(resolved).resolve()) if Path(resolved).exists() else resolved
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append((resolved, source))
+    return result
+
+
+def inspect_codex_binary(binary: str) -> dict[str, Any]:
+    path = Path(binary).expanduser()
+    if not path.exists() or not os.access(path, os.X_OK):
+        return {
+            "binary": str(path),
+            "version": "",
+            "capabilities": {},
+            "compatible": False,
+            "reason": "binary missing or not executable",
+        }
+    version_result = run_probe([str(path), "--version"])
+    help_result = run_probe([str(path), "exec", "--help"])
+    version_text = version_result.stdout.strip() if version_result else ""
+    help_text = "\n".join(
+        item for item in (
+            help_result.stdout if help_result else "",
+            help_result.stderr if help_result else "",
+        )
+        if item
+    )
+    capabilities = {flag: flag in help_text for flag in REQUIRED_CODEX_EXEC_FLAGS}
+    version_ok = codex_version_at_least(version_text, MIN_CODEX_VERSION)
+    flags_ok = all(capabilities.values())
+    compatible = bool(version_result and version_result.returncode == 0 and help_result and help_result.returncode == 0 and version_ok and flags_ok)
+    missing_flags = [flag for flag, present in capabilities.items() if not present]
+    reason = ""
+    if not version_result or version_result.returncode != 0:
+        reason = "version probe failed"
+    elif not help_result or help_result.returncode != 0:
+        reason = "exec help probe failed"
+    elif not version_ok:
+        reason = f"version below {format_version_tuple(MIN_CODEX_VERSION)}"
+    elif missing_flags:
+        reason = f"missing flags: {', '.join(missing_flags)}"
+    return {
+        "binary": str(path.resolve()),
+        "version": version_text,
+        "capabilities": capabilities,
+        "compatible": compatible,
+        "reason": reason,
+    }
+
+
+def run_probe(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=5)
+    except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def codex_version_at_least(version_text: str, minimum: tuple[int, int, int]) -> bool:
+    parsed = parse_version_tuple(version_text)
+    return parsed >= minimum if parsed else False
+
+
+def parse_version_tuple(version_text: str) -> tuple[int, int, int]:
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", version_text)
+    if not match:
+        return (0, 0, 0)
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def format_version_tuple(value: tuple[int, int, int]) -> str:
+    return ".".join(str(item) for item in value)
 
 
 def default_state_dir() -> Path:
@@ -2127,8 +2469,8 @@ def require_runtime_credentials(settings: WorkerSettings) -> None:
         missing.append("gh")
     if shutil.which("claude") is None:
         missing.append("claude")
-    if shutil.which("codex") is None:
-        missing.append("codex")
+    if not settings.codex_toolchain_compatible:
+        missing.append("compatible codex")
     if missing:
         raise OrchestratorError(
             "Missing orchestrator runtime prerequisites: " + ", ".join(missing)
@@ -3013,7 +3355,77 @@ Return JSON matching the provided schema.
 Claude plan:
 {json.dumps(plan_payload, indent=2, ensure_ascii=False)}
 """.strip()
-    argv = codex_exec_argv(settings)
+    first = run_codex_exec_attempt(
+        store,
+        settings,
+        worktree_path,
+        project_key,
+        issue_key,
+        branch,
+        prompt,
+        schema,
+        output_file,
+        exclude_binaries=(),
+    )
+    if classify_codex_cli_failure(first) == "codex_cli_incompatible":
+        store.record_step(issue_key, "toolchain_recovery", "warning", codex_recovery_payload(first, None))
+        retry = run_codex_exec_attempt(
+            store,
+            settings,
+            worktree_path,
+            project_key,
+            issue_key,
+            branch,
+            prompt,
+            schema,
+            output_file,
+            exclude_binaries=(str(first.get("codex_binary", "")),),
+        )
+        if classify_codex_cli_failure(retry) != "codex_cli_incompatible" and retry["status"] in {"success", "fallback"}:
+            retry["toolchain_recovery"] = codex_recovery_payload(first, retry)
+            retry["summary"] = retry.get("summary") or "Codex CLI recovered and completed."
+            store.record_step(issue_key, "toolchain_recovery", "success", retry["toolchain_recovery"])
+            return retry
+        retry["status"] = "blocked"
+        retry["toolchain_recovery"] = codex_recovery_payload(first, retry)
+        retry["summary"] = codex_recovery_blocker_summary(retry["toolchain_recovery"])
+        store.record_step(issue_key, "toolchain_recovery", "failed", retry["toolchain_recovery"])
+        return retry
+    return first
+
+
+def run_codex_exec_attempt(
+    store: OrchestratorStore,
+    settings: WorkerSettings,
+    worktree_path: Path,
+    project_key: str,
+    issue_key: str,
+    branch: str,
+    prompt: str,
+    schema: Path,
+    output_file: Path,
+    *,
+    exclude_binaries: tuple[str, ...],
+) -> dict[str, Any]:
+    if output_file.exists():
+        output_file.unlink()
+    try:
+        argv = codex_exec_argv(settings, exclude_binaries=exclude_binaries)
+    except OrchestratorError as exc:
+        return {
+            "status": "blocked",
+            "exit_code": None,
+            "stdout": "",
+            "stderr": str(exc),
+            "changed_files": git_changed_files(worktree_path),
+            "validation_passed": False,
+            "fallback_used": False,
+            "timed_out": False,
+            "branch": branch,
+            "codex_binary": "",
+            "codex_version": "",
+            "summary": f"Codex CLI unavailable: {exc}",
+        }
     argv.extend(
         [
             "--json",
@@ -3047,6 +3459,8 @@ Claude plan:
         "fallback_used": bool(timed_out and changed_files),
         "timed_out": timed_out,
         "branch": branch,
+        "codex_binary": argv[0],
+        "codex_version": inspect_codex_binary(argv[0]).get("version", ""),
     }
     if output_file.exists():
         try:
@@ -3065,6 +3479,7 @@ Claude plan:
         payload["timed_out"] = True
     return payload
 
+
 def run_codex_review(
     store: OrchestratorStore,
     settings: WorkerSettings,
@@ -3072,7 +3487,52 @@ def run_codex_review(
     worktree_path: Path,
 ) -> dict[str, Any]:
     stage_meaningful_changes(worktree_path)
-    argv = codex_exec_argv(settings)
+    first = run_codex_review_attempt(store, settings, issue_key, worktree_path, exclude_binaries=())
+    if classify_codex_cli_failure(first) == "codex_cli_incompatible":
+        store.record_step(issue_key, "toolchain_recovery", "warning", codex_recovery_payload(first, None))
+        retry = run_codex_review_attempt(
+            store,
+            settings,
+            issue_key,
+            worktree_path,
+            exclude_binaries=(str(first.get("codex_binary", "")),),
+        )
+        if classify_codex_cli_failure(retry) != "codex_cli_incompatible" and retry["status"] in {"success", "fallback"}:
+            retry["toolchain_recovery"] = codex_recovery_payload(first, retry)
+            retry["summary"] = retry.get("summary") or "Codex CLI recovered and completed review."
+            store.record_step(issue_key, "toolchain_recovery", "success", retry["toolchain_recovery"])
+            return retry
+        retry["status"] = "blocked"
+        retry["toolchain_recovery"] = codex_recovery_payload(first, retry)
+        retry["summary"] = codex_recovery_blocker_summary(retry["toolchain_recovery"])
+        store.record_step(issue_key, "toolchain_recovery", "failed", retry["toolchain_recovery"])
+        return retry
+    return first
+
+
+def run_codex_review_attempt(
+    store: OrchestratorStore,
+    settings: WorkerSettings,
+    issue_key: str,
+    worktree_path: Path,
+    *,
+    exclude_binaries: tuple[str, ...],
+) -> dict[str, Any]:
+    try:
+        argv = codex_exec_argv(settings, exclude_binaries=exclude_binaries)
+    except OrchestratorError as exc:
+        return {
+            "status": "blocked",
+            "exit_code": None,
+            "stdout": "",
+            "stderr": str(exc),
+            "summary": f"Codex CLI unavailable: {exc}",
+            "changed_files": git_changed_files(worktree_path),
+            "timed_out": False,
+            "fallback_used": False,
+            "codex_binary": "",
+            "codex_version": "",
+        }
     argv.extend(
         [
             "review",
@@ -3103,6 +3563,8 @@ def run_codex_review(
             "changed_files": changed_files,
             "timed_out": True,
             "fallback_used": True,
+            "codex_binary": argv[0],
+            "codex_version": inspect_codex_binary(argv[0]).get("version", ""),
         }
     summary = summarize_codex_jsonl(stdout)
     return {
@@ -3114,16 +3576,61 @@ def run_codex_review(
         "changed_files": changed_files,
         "fallback_used": False,
         "timed_out": False,
+        "codex_binary": argv[0],
+        "codex_version": inspect_codex_binary(argv[0]).get("version", ""),
     }
 
 
-def codex_exec_argv(settings: WorkerSettings) -> list[str]:
-    argv = ["codex", "exec"]
+def codex_exec_argv(settings: WorkerSettings, *, exclude_binaries: tuple[str, ...] = ()) -> list[str]:
+    toolchain = resolve_codex_toolchain(
+        configured_binary=str(getattr(settings, "codex_binary", DEFAULT_CODEX_BINARY)),
+        write=True,
+        require=True,
+        exclude_binaries=exclude_binaries,
+    )
+    argv = [str(toolchain["binary"]), "exec"]
     if settings.codex_ignore_user_config:
         argv.append("--ignore-user-config")
     if settings.codex_model:
         argv.extend(["--model", settings.codex_model])
     return argv
+
+
+def classify_codex_cli_failure(payload: dict[str, Any]) -> str:
+    text = "\n".join(
+        str(payload.get(key, ""))
+        for key in ("stderr", "stdout", "summary")
+        if payload.get(key)
+    ).lower()
+    if any(pattern in text for pattern in CODEX_CLI_INCOMPATIBLE_PATTERNS):
+        return "codex_cli_incompatible"
+    return ""
+
+
+def codex_recovery_payload(first: dict[str, Any], retry: dict[str, Any] | None) -> dict[str, Any]:
+    previous_binary = str(first.get("codex_binary", ""))
+    recovered_binary = str((retry or {}).get("codex_binary", ""))
+    recovered_version = str((retry or {}).get("codex_version", ""))
+    payload = {
+        "classification": "codex_cli_incompatible",
+        "previous_binary": previous_binary,
+        "previous_version": str(first.get("codex_version", "")),
+        "recovered_binary": recovered_binary,
+        "recovered_version": recovered_version,
+        "summary": "Codex CLI compatibility issue detected.",
+    }
+    if recovered_binary:
+        payload["summary"] = f"Codex CLI recovered: {previous_binary} -> {recovered_binary}"
+    return payload
+
+
+def codex_recovery_blocker_summary(payload: dict[str, Any]) -> str:
+    return (
+        "Codex CLI compatibility recovery failed. "
+        f"Previous binary: {payload.get('previous_binary') or 'unknown'}. "
+        f"Retry binary: {payload.get('recovered_binary') or 'none'}. "
+        "Run `platform toolchain doctor` and `platform toolchain pin-codex --binary <compatible-codex>`."
+    )
 
 
 def ensure_pull_request(

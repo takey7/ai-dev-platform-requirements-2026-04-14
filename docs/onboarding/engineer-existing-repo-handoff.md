@@ -95,12 +95,15 @@ cd ai-dev-platform-requirements-2026-04-14
   --jira-site-url https://<JIRA_SITE>.atlassian.net \
   --jira-admin-email <ATLASSIAN_ADMIN_EMAIL> \
   --codex-model "" \
+  --codex-binary auto \
   --codex-ignore-user-config \
   --claude-model default \
   --claude-effort ""
+
+./bin/platform toolchain doctor
 ```
 
-`--codex-model ""` は Codex CLI の組み込み最新版デフォルト追従です。worker は既定で `~/.codex/config.toml` を読まないため、個人の model 設定に引きずられません。
+`--codex-model ""` は Codex CLI の組み込み最新版デフォルト追従です。worker は `~/.config/ai-dev-platform/toolchain.json` の互換済み Codex binary を使い、既定で `~/.codex/config.toml` を読まないため、個人の PATH や model 設定に引きずられません。
 
 ## 5. 今いる repo を一括セットアップ
 
