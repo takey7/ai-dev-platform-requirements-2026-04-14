@@ -84,7 +84,7 @@ cd ai-dev-platform-requirements-2026-04-14
   --github-owner <GITHUB_OWNER> \
   --projects-root ~/workspaces \
   --source-repo takey7/ai-dev-platform-requirements-2026-04-14 \
-  --source-ref main \
+  --source-ref v0.2.0 \
   --adapter node-ts \
   --launch-mode none \
   --jira-site-url https://<JIRA_SITE>.atlassian.net \
@@ -191,7 +191,17 @@ cd ~/workspaces/ai-dev-platform-requirements-2026-04-14
 ```
 
 これで Claude が Jira issue を読み、Codex が実装し、GitHub PR 作成まで進みます。
-merge は v1 では自動化しません。
+実装前には Codex の理解内容を Claude coordinator が承認する mediated baton を通します。
+既定では PR が `ready_for_merge` になった後、GitHub auto-merge / merge queue を有効化します。ローカル worker が直接 merge commit を作る運用は標準ではありません。
+
+複数 issue をまとめて流す場合:
+
+```bash
+./bin/platform orchestrator batch create \
+  --project <JIRA_KEY> \
+  --jql 'project = <JIRA_KEY> AND labels = "ai:auto" AND status in ("To Do", "Selected for Development")' \
+  --max-parallel 3
+```
 
 ## 完了条件
 

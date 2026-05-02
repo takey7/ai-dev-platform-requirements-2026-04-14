@@ -22,7 +22,7 @@ if str(SCRIPT_PATH.parent) not in sys.path:
     sys.path.insert(0, str(SCRIPT_PATH.parent))
 import platform_orchestrator
 
-DEFAULT_PLATFORM_VERSION = "0.1.0"
+DEFAULT_PLATFORM_VERSION = "0.2.0"
 DEFAULT_SOURCE_REF = "main"
 DEFAULT_ATLASSIAN_MCP_URL = "https://mcp.atlassian.com/v1/mcp"
 DEFAULT_PROJECTS_ROOT = str((Path.home() / "workspaces").expanduser())

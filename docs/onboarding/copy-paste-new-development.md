@@ -40,7 +40,7 @@ export PROJECTS_ROOT="$HOME/workspaces"
 
 export GITHUB_OWNER="takey7"
 export PLATFORM_SOURCE_REPO="takey7/ai-dev-platform-requirements-2026-04-14"
-export PLATFORM_VERSION="v0.1.13"
+export PLATFORM_VERSION="v0.2.0"
 
 export JIRA_SITE_URL="https://ssbot.atlassian.net"
 export JIRA_ADMIN_EMAIL="YOUR_ATLASSIAN_ADMIN_EMAIL@example.com"
@@ -253,11 +253,14 @@ worker が polling で issue を拾うと、自動で次を進めます。
 - `docs/specs/<ISSUE>.md` 作成
 - branch / worktree 作成
 - Claude planning
+- Codex understanding
+- Claude coordinator approval
 - Codex coding
 - Codex local review
 - PR 作成
 - GitHub checks 待ち
 - Codex review artifact 待ち
+- ready 後は GitHub auto-merge / merge queue を有効化
 - Jira sticky comment 更新
 - 作業開始時に Jira status を `In Progress` / `進行中` / `作業中` へ移動
 - PR merge 後だけ Jira status を `Done` / `完了` へ移動
@@ -310,9 +313,9 @@ cd "$PLATFORM_SOURCE"
 - `chatgpt-codex-connector` の review、または `Codex Review:` artifact がある
 - Jira sticky comment に state / branch / PR URL / checks / review が書き戻される
 - Jira は `ready_for_merge` では Done にならず、PR merge 後だけ Done になる
-- worker は `ready_for_merge` で止まる
+- 既定では worker が `ready_for_merge` 後に GitHub auto-merge / merge queue を有効化する
 
-merge は v1 では自動実行しません。人間または GitHub rules / merge queue に任せます。
+merge は GitHub 側の branch protection / merge queue / auto-merge 設定を最終統制面にします。ローカル worker が直接 merge commit を作る運用は標準ではありません。
 
 ## 11. 自動実装が止まったとき
 
@@ -331,6 +334,7 @@ cd "$PLATFORM_SOURCE"
 ./bin/platform orchestrator pause --issue "$ISSUE_KEY"
 ./bin/platform orchestrator resume --issue "$ISSUE_KEY"
 ./bin/platform orchestrator cancel --issue "$ISSUE_KEY"
+./bin/platform orchestrator fail --issue "$ISSUE_KEY" --backlog --reason "manual failover"
 ```
 
 Jira comment からも操作できます。
@@ -386,6 +390,33 @@ export CONSUMER_REPO="$PROJECTS_ROOT/$REPO_NAME"
 ```
 
 その後、手順 4 から繰り返します。複数 repo は `projects_roots[]` 配下で共存できますが、`JIRA_KEY` は repo ごとに必ず一意にします。
+
+## 13.5. 複数 issue をまとめて並列実行する場合
+
+同じ repo / Jira project 内で複数 issue を短期間に進める場合は batch を使います。
+
+```bash
+cd "$PLATFORM_SOURCE"
+
+./bin/platform orchestrator batch create \
+  --project "$JIRA_KEY" \
+  --jql "project = $JIRA_KEY AND labels = \"ai:auto\" AND status in (\"To Do\", \"Selected for Development\")" \
+  --max-parallel 3
+
+./bin/platform orchestrator batch status
+```
+
+Claude coordinator が dependency / conflict group / task contract を作ります。同じ conflict group や依存関係がある issue は同時に lease されず、独立 issue だけが並列で Codex worker に渡ります。
+
+停止・再開:
+
+```bash
+export BATCH_ID="<batch_id>"
+
+./bin/platform orchestrator batch pause --batch "$BATCH_ID"
+./bin/platform orchestrator batch resume --batch "$BATCH_ID"
+./bin/platform orchestrator batch cancel --batch "$BATCH_ID"
+```
 
 ## 14. 最終チェック
 

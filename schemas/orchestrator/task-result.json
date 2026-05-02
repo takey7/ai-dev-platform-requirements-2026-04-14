@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "required": [
+    "summary",
+    "changed_files",
+    "validation_passed"
+  ],
+  "properties": {
+    "summary": { "type": "string", "minLength": 1 },
+    "changed_files": { "type": "array", "items": { "type": "string" } },
+    "validation_passed": { "type": "boolean" },
+    "blocked_reason": { "type": "string" },
+    "follow_up": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}

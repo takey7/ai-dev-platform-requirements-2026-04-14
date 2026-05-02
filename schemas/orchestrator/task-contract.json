@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "required": [
+    "issue_key",
+    "goal",
+    "acceptance_criteria",
+    "files_in_scope",
+    "out_of_scope",
+    "constraints",
+    "validation_commands",
+    "risk_flags",
+    "dependencies"
+  ],
+  "properties": {
+    "issue_key": { "type": "string", "minLength": 1 },
+    "goal": { "type": "string", "minLength": 1 },
+    "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+    "files_in_scope": { "type": "array", "items": { "type": "string" } },
+    "out_of_scope": { "type": "array", "items": { "type": "string" } },
+    "constraints": { "type": "array", "items": { "type": "string" } },
+    "validation_commands": { "type": "array", "items": { "type": "string" } },
+    "risk_flags": { "type": "array", "items": { "type": "string" } },
+    "dependencies": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}

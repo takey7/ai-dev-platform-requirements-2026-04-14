@@ -189,11 +189,12 @@ claude -p --permission-mode bypassPermissions \
 2. Jira status を `In Progress` / `進行中` / `作業中` へ best-effort transition する
 3. `docs/specs/<ISSUE>.md` を生成する
 4. worktree と branch を作る
-5. Claude planning -> Codex coding/review -> Claude integrate を回す
+5. Claude planning -> Codex understanding -> Claude approval -> Codex coding/review -> Claude integrate を回す
 6. PR を作る
 7. GitHub checks を待つ
 8. Codex review artifact を待つ
-9. `ready_for_merge` か `blocked` を Jira sticky comment に返す
+9. `ready_for_merge` 後に GitHub auto-merge / merge queue を有効化する
+10. PR merge 後だけ Jira を `Done` / `完了` に移す
 
 ## 9. 日常の監視と操作
 status:
@@ -230,6 +231,7 @@ worker の動作:
 3. Codex review artifact 待ち
 4. 来なければ `@codex review` fallback
 5. それでも来なければ Jira に `blocked` を返す
+6. review が揃ったら GitHub auto-merge / merge queue を有効化する
 
 確認コマンド:
 ```bash
@@ -254,6 +256,19 @@ worker が止まっていた場合は、GitHub 状態を手動で再取得しま
 - sticky comment の branch / PR URL がその repo だけを指す
 - 他 repo の PR や Jira issue key が混ざらない
 
+## 11.5. 同一 project 内で複数 issue を並列に進める
+
+```bash
+./bin/platform orchestrator batch create \
+  --project <PROJECT_KEY> \
+  --jql 'project = <PROJECT_KEY> AND labels = "ai:auto" AND status in ("To Do", "Selected for Development")' \
+  --max-parallel 3
+
+./bin/platform orchestrator batch status
+```
+
+Claude coordinator が batch 内の DAG、依存関係、conflict group、共有設計メモを作ります。Codex は issue 単位の worktree / branch / PR だけを担当します。
+
 ## 12. 失敗時の切り分け
 - Jira issue が拾われない:
   - issue に `ai:auto` label があるか確認
@@ -272,5 +287,7 @@ worker が止まっていた場合は、GitHub 状態を手動で再取得しま
 - Jira は Kanban
 - Claude の Jira issue 作成は explicit-only
 - Codex review は automatic review を正道、`@codex review` は fallback
-- Worker は `ready_for_merge` で止まり、merge は人または GitHub rules に委ねる
+- Worker は `ready_for_merge` 後に GitHub auto-merge / merge queue を有効化する
+- ローカル autopilot merge は標準経路ではない
 - Jira は作業開始で `In Progress` 相当、PR merge 後だけ `Done` 相当へ移動する
+- transient failure は bounded retry し、上限超過や validation failure は failed/backlog に戻して次 issue へ進む

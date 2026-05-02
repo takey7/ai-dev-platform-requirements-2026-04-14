@@ -42,14 +42,21 @@ LEGACY_HEADER_NAME = "X-Platform-Shared-Secret"
 DEFAULT_CODEX_REVIEW_AUTHORS = ("codex", "codex[bot]", "chatgpt-codex-connector")
 DEFAULT_AUTO_REVIEW_GRACE_SECONDS = 180
 DEFAULT_FALLBACK_REVIEW_GRACE_SECONDS = 300
-DEFAULT_CLAUDE_TIMEOUT_SECONDS = 300
-DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 120
-DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS = 60
+DEFAULT_CLAUDE_TIMEOUT_SECONDS = 600
+DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 900
+DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS = 180
 DEFAULT_CODEX_MODEL = ""
 DEFAULT_CODEX_BINARY = "auto"
 DEFAULT_CODEX_IGNORE_USER_CONFIG = True
 DEFAULT_CLAUDE_MODEL = "default"
 DEFAULT_CLAUDE_EFFORT = ""
+DEFAULT_MAX_PARALLEL_PER_REPO = 3
+DEFAULT_MAX_PARALLEL_PER_PROJECT = 5
+DEFAULT_CONTRACT_HANDSHAKE = "required"
+DEFAULT_MAX_BATON_ROUNDS = 2
+DEFAULT_FAILURE_MAX_ATTEMPTS = 2
+DEFAULT_FAILURE_BACKLOG_STATUSES = ("To Do", "Backlog")
+DEFAULT_GITHUB_MERGE_POLICY = "merge_queue"
 DEFAULT_TRANSITION_POLICY_MODE = "kanban_minimal"
 DEFAULT_ACTIVE_STATUS_ALIASES = ("In Progress", "進行中", "作業中")
 DEFAULT_DONE_STATUS_ALIASES = ("Done", "完了")
@@ -110,6 +117,9 @@ CODEX_CLI_INCOMPATIBLE_PATTERNS = (
     "requires a newer version of codex",
     "no such file or directory",
 )
+TRANSIENT_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+DEFAULT_API_RETRY_ATTEMPTS = 3
+PLATFORM_RELEASE_VERSION = "v0.2.0"
 
 
 class OrchestratorError(RuntimeError):
@@ -149,6 +159,16 @@ class WorkerSettings:
     codex_review_authors: tuple[str, ...]
     auto_review_grace_seconds: int
     fallback_review_grace_seconds: int
+    max_parallel_per_repo: int
+    max_parallel_per_project: int
+    contract_handshake: str
+    max_baton_rounds: int
+    failure_max_attempts: int
+    failure_backlog_statuses: tuple[str, ...]
+    github_merge_policy: str
+    claude_timeout_seconds: int
+    codex_exec_timeout_seconds: int
+    codex_review_timeout_seconds: int
     codex_model: str
     codex_binary: str
     codex_resolved_binary: str
@@ -252,6 +272,19 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
         choices=["", "low", "medium", "high", "xhigh", "max"],
         default=None,
         help="Claude Code effort level for worker planning/integration. Empty string defers to Claude defaults.",
+    )
+    configure.add_argument("--max-parallel-per-repo", type=int, default=None, help="Maximum concurrent jobs per repo.")
+    configure.add_argument("--max-parallel-per-project", type=int, default=None, help="Maximum concurrent jobs per Jira project.")
+    configure.add_argument("--max-baton-rounds", type=int, default=None, help="Maximum Claude/Codex contract clarification rounds.")
+    configure.add_argument("--codex-exec-timeout", type=int, default=None, help="Codex implementation timeout in seconds.")
+    configure.add_argument("--codex-review-timeout", type=int, default=None, help="Codex local review timeout in seconds.")
+    configure.add_argument("--claude-timeout", type=int, default=None, help="Claude planning/integration timeout in seconds.")
+    configure.add_argument("--failure-max-attempts", type=int, default=None, help="Maximum attempts before failing and returning to backlog.")
+    configure.add_argument(
+        "--github-merge-policy",
+        choices=["merge_queue", "manual"],
+        default=None,
+        help="Merge policy after ready_for_merge. Default enables GitHub auto-merge/merge queue.",
     )
     configure.set_defaults(func=cmd_configure)
 
@@ -408,6 +441,41 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     retry.add_argument("--issue", required=True, help="Issue key to retry.")
     retry.set_defaults(func=cmd_retry)
 
+    fail = orchestrator_subparsers.add_parser(
+        "fail",
+        help="Mark an issue failed and optionally return it to the Jira backlog.",
+    )
+    fail.add_argument("--config", default=None, help="Override the worker config path.")
+    fail.add_argument("--issue", required=True, help="Issue key to mark failed.")
+    fail.add_argument("--reason", default="operator marked failed", help="Failure reason.")
+    fail.add_argument("--backlog", action="store_true", help="Best-effort transition back to To Do / Backlog.")
+    fail.set_defaults(func=cmd_fail)
+
+    batch = orchestrator_subparsers.add_parser(
+        "batch",
+        help="Create and control multi-issue mediated development batches.",
+    )
+    batch_subparsers = batch.add_subparsers(dest="batch_command", required=True)
+    batch_create = batch_subparsers.add_parser("create", help="Create a batch from a Jira JQL query.")
+    batch_create.add_argument("--config", default=None, help="Override the worker config path.")
+    batch_create.add_argument("--project", required=True, help="Jira project key.")
+    batch_create.add_argument("--jql", required=True, help="JQL selecting issues for the batch.")
+    batch_create.add_argument("--max-parallel", type=int, default=DEFAULT_MAX_PARALLEL_PER_REPO)
+    batch_create.set_defaults(func=cmd_batch_create)
+    batch_status = batch_subparsers.add_parser("status", help="Show batch status.")
+    batch_status.add_argument("--config", default=None, help="Override the worker config path.")
+    batch_status.add_argument("--batch", default=None, help="Batch id.")
+    batch_status.set_defaults(func=cmd_batch_status)
+    for name, help_text in (
+        ("pause", "Pause a batch."),
+        ("resume", "Resume a batch."),
+        ("cancel", "Cancel a batch."),
+    ):
+        parser = batch_subparsers.add_parser(name, help=help_text)
+        parser.add_argument("--config", default=None, help="Override the worker config path.")
+        parser.add_argument("--batch", required=True, help="Batch id.")
+        parser.set_defaults(func=cmd_batch_control)
+
     install_agent = orchestrator_subparsers.add_parser(
         "install-agent",
         help="Install a macOS LaunchAgent that restarts the polling worker at login.",
@@ -480,6 +548,41 @@ def cmd_configure(args: argparse.Namespace) -> int:
         if args.claude_effort is not None:
             ai_config["claude_effort"] = args.claude_effort.strip()
         config["ai"] = ai_config
+    if (
+        getattr(args, "max_parallel_per_repo", None) is not None
+        or getattr(args, "max_parallel_per_project", None) is not None
+        or getattr(args, "max_baton_rounds", None) is not None
+    ):
+        scheduler_config = dict(config.get("scheduler", {}))
+        if getattr(args, "max_parallel_per_repo", None) is not None:
+            scheduler_config["max_parallel_per_repo"] = max(1, int(args.max_parallel_per_repo))
+        if getattr(args, "max_parallel_per_project", None) is not None:
+            scheduler_config["max_parallel_per_project"] = max(1, int(args.max_parallel_per_project))
+        if getattr(args, "max_baton_rounds", None) is not None:
+            scheduler_config["max_baton_rounds"] = max(0, int(args.max_baton_rounds))
+        scheduler_config.setdefault("contract_handshake", DEFAULT_CONTRACT_HANDSHAKE)
+        config["scheduler"] = scheduler_config
+    if (
+        getattr(args, "codex_exec_timeout", None) is not None
+        or getattr(args, "codex_review_timeout", None) is not None
+        or getattr(args, "claude_timeout", None) is not None
+    ):
+        timeout_config = dict(config.get("timeouts", {}))
+        if getattr(args, "codex_exec_timeout", None) is not None:
+            timeout_config["codex_exec_seconds"] = max(1, int(args.codex_exec_timeout))
+        if getattr(args, "codex_review_timeout", None) is not None:
+            timeout_config["codex_review_seconds"] = max(1, int(args.codex_review_timeout))
+        if getattr(args, "claude_timeout", None) is not None:
+            timeout_config["claude_seconds"] = max(1, int(args.claude_timeout))
+        config["timeouts"] = timeout_config
+    if getattr(args, "failure_max_attempts", None) is not None:
+        failure_config = dict(config.get("failure", {}))
+        failure_config["max_attempts"] = max(1, int(args.failure_max_attempts))
+        config["failure"] = failure_config
+    if getattr(args, "github_merge_policy", None) is not None:
+        github_config = dict(config.get("github", {}))
+        github_config["merge_policy"] = args.github_merge_policy
+        config["github"] = github_config
     save_orchestrator_config(config, config_path)
     print(f"Saved orchestrator config: {config_path}")
     print(json.dumps(config, indent=2, ensure_ascii=False))
@@ -706,6 +809,62 @@ def cmd_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fail(args: argparse.Namespace) -> int:
+    settings = load_worker_settings(config_override=args.config)
+    store = OrchestratorStore(settings.db_path)
+    issue_key = args.issue.upper()
+    fail_issue_job(
+        store,
+        settings,
+        issue_key,
+        reason=args.reason,
+        backlog=bool(args.backlog),
+    )
+    OrchestratorService(settings=settings, store=store).refresh_issue_report(issue_key)
+    print(f"Marked failed: {issue_key}")
+    return 0
+
+
+def cmd_batch_create(args: argparse.Namespace) -> int:
+    settings = load_worker_settings(config_override=args.config)
+    require_runtime_credentials(settings)
+    store = OrchestratorStore(settings.db_path)
+    service = OrchestratorService(settings=settings, store=store)
+    service.sync_projects()
+    batch = create_batch_from_jql(
+        store=store,
+        settings=settings,
+        project_key=args.project.upper(),
+        jql=args.jql,
+        max_parallel=max(1, int(args.max_parallel)),
+    )
+    print(json.dumps(batch, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_batch_status(args: argparse.Namespace) -> int:
+    settings = load_worker_settings(config_override=args.config)
+    store = OrchestratorStore(settings.db_path)
+    print(json.dumps(store.list_batches(batch_id=args.batch), indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_batch_control(args: argparse.Namespace) -> int:
+    settings = load_worker_settings(config_override=args.config)
+    store = OrchestratorStore(settings.db_path)
+    command = str(args.batch_command)
+    state = {"pause": "paused", "resume": "running", "cancel": "cancelled"}[command]
+    store.update_batch_state(args.batch, state)
+    if command == "cancel":
+        for job in store.list_jobs_for_batch(args.batch):
+            store.set_requested_action(str(job["issue_key"]), "cancel")
+            signal_active_process(job.get("active_pid"))
+            if str(job.get("state", "")) == "queued":
+                store.update_job(str(job["issue_key"]), state="cancelled", requested_action="")
+    print(f"Batch {args.batch} {command} requested")
+    return 0
+
+
 def cmd_install_agent(args: argparse.Namespace) -> int:
     platform_root = Path(args.platform_root).expanduser().resolve()
     plist_path = launch_agent_plist_path(args.label)
@@ -818,6 +977,136 @@ def retry_issue_job(store: "OrchestratorStore", issue_key: str, *, reason: str) 
     )
 
 
+def fail_issue_job(
+    store: "OrchestratorStore",
+    settings: WorkerSettings,
+    issue_key: str,
+    *,
+    reason: str,
+    backlog: bool,
+) -> None:
+    job = store.get_job(issue_key)
+    if not job:
+        raise OrchestratorError(f"Job not found: {issue_key}")
+    signal_active_process(job.get("active_pid"))
+    store.release_lease(str(job.get("repo_path", "")), issue_key)
+    attempt_count = int(job.get("attempt_count") or 0) + 1
+    store.update_job(
+        issue_key,
+        state="failed",
+        latest_error=reason,
+        active_pid=None,
+        requested_action="",
+        attempt_count=attempt_count,
+    )
+    payload = {
+        "summary": reason,
+        "backlog_requested": backlog,
+        "attempt": attempt_count,
+        "retry_command": f"platform orchestrator retry --issue {issue_key}",
+    }
+    if backlog:
+        transition = transition_jira_issue_to_aliases(
+            settings,
+            issue_key,
+            getattr(settings, "failure_backlog_statuses", DEFAULT_FAILURE_BACKLOG_STATUSES),
+        )
+        payload["backlog_transition"] = transition
+        if transition.get("status_name"):
+            store.update_job(issue_key, status_name=str(transition["status_name"]))
+    store.record_step(issue_key, "failed", "failed", payload)
+    store.record_attempt(
+        issue_key,
+        batch_id=str(job.get("batch_id", "")),
+        attempt=attempt_count,
+        step_name="failed",
+        status="failed",
+        classification=classify_failure_reason(reason),
+        payload=payload,
+    )
+
+
+def retry_transient_or_fail_issue_job(
+    store: "OrchestratorStore",
+    settings: WorkerSettings,
+    issue_key: str,
+    *,
+    reason: str,
+    backlog: bool,
+) -> str:
+    job = store.get_job(issue_key)
+    if not job:
+        raise OrchestratorError(f"Job not found: {issue_key}")
+    classification = classify_failure_reason(reason)
+    next_attempt = int(job.get("attempt_count") or 0) + 1
+    max_attempts = int(getattr(settings, "failure_max_attempts", DEFAULT_FAILURE_MAX_ATTEMPTS))
+    if classification == "transient_network_or_timeout" and next_attempt < max_attempts:
+        signal_active_process(job.get("active_pid"))
+        store.release_lease(str(job.get("repo_path", "")), issue_key)
+        payload = {
+            "summary": reason,
+            "classification": classification,
+            "attempt": next_attempt,
+            "max_attempts": max_attempts,
+            "next_state": "queued",
+        }
+        store.update_job(
+            issue_key,
+            state="queued",
+            latest_error=f"Transient failure; retrying attempt {next_attempt + 1}/{max_attempts}: {reason}",
+            active_pid=None,
+            requested_action="",
+            attempt_count=next_attempt,
+        )
+        store.record_step(issue_key, "transient_retry", "warning", payload)
+        store.record_attempt(
+            issue_key,
+            batch_id=str(job.get("batch_id", "")),
+            attempt=next_attempt,
+            step_name="transient_retry",
+            status="retrying",
+            classification=classification,
+            payload=payload,
+        )
+        return "queued"
+    fail_issue_job(store, settings, issue_key, reason=reason, backlog=backlog)
+    return "failed"
+
+
+def classify_failure_reason(reason: str) -> str:
+    text = reason.lower()
+    if any(fragment in text for fragment in ("nodename nor servname", "temporary failure", "timed out", "timeout")):
+        return "transient_network_or_timeout"
+    if "codex" in text and ("version" in text or "argument" in text or "option" in text):
+        return "codex_cli_incompatible"
+    if "validation" in text or "test" in text:
+        return "validation_failure"
+    return "failed"
+
+
+def dependencies_satisfied(store: "OrchestratorStore", job: dict[str, Any]) -> bool:
+    dependencies = parse_dependencies(job.get("dependencies_json"))
+    for dependency in dependencies:
+        dep_job = store.get_job(dependency)
+        if not dep_job or dep_job.get("state") != "done":
+            return False
+    return True
+
+
+def parse_dependencies(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [normalize_issue_key(item) for item in value if normalize_issue_key(item)]
+    if not value:
+        return []
+    try:
+        decoded = json.loads(str(value))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [normalize_issue_key(item) for item in decoded if normalize_issue_key(item)]
+
+
 def status_hints(
     rows: list[dict[str, Any]],
     *,
@@ -843,9 +1132,15 @@ def status_hints(
             f"Worker: {worker_source_repo}. CLI: {REPO_ROOT}. Restart the worker from the current source repo."
         )
     if worker_source_repo.endswith("-v0.1.11"):
-        hints.append(f"Last recorded worker source repo looks stale: {worker_source_repo}. Restart from v0.1.13.")
+        hints.append(
+            f"Last recorded worker source repo looks stale: {worker_source_repo}. "
+            f"Restart from the {PLATFORM_RELEASE_VERSION} source repo."
+        )
     if str(REPO_ROOT).endswith("-v0.1.11"):
-        hints.append(f"Worker source repo looks stale: {REPO_ROOT}. Restart from the v0.1.13 source repo.")
+        hints.append(
+            f"Worker source repo looks stale: {REPO_ROOT}. "
+            f"Restart from the {PLATFORM_RELEASE_VERSION} source repo."
+        )
     return hints
 
 
@@ -991,7 +1286,7 @@ class OrchestratorService:
         elif command == "retry":
             job = self.store.get_job(issue_key)
             if job and job["state"] in {"failed", "blocked"}:
-                self.store.update_job(issue_key, state="queued", latest_error="", requested_action="")
+                retry_issue_job(self.store, issue_key, reason="Jira /ai retry")
         elif command == "status":
             self.refresh_issue_report(issue_key)
 
@@ -1085,10 +1380,26 @@ class OrchestratorService:
                 continue
             if self.store.control_flag_value("project", project_key, "drain") == "enabled":
                 continue
+            batch_id = str(job.get("batch_id", ""))
+            if batch_id:
+                batch = self.store.batch(batch_id)
+                if str(batch.get("state", "")) in {"paused", "cancelled"}:
+                    continue
+                if not dependencies_satisfied(self.store, job):
+                    continue
             with self.thread_lock:
                 if issue_key in self.active_threads:
                     continue
-            if not self.store.acquire_lease(repo_path, issue_key):
+            if not self.store.acquire_lease(
+                repo_path,
+                issue_key,
+                project_key=project_key,
+                conflict_group=str(job.get("conflict_group") or issue_key),
+                max_parallel_per_repo=int(getattr(self.settings, "max_parallel_per_repo", DEFAULT_MAX_PARALLEL_PER_REPO)),
+                max_parallel_per_project=int(
+                    getattr(self.settings, "max_parallel_per_project", DEFAULT_MAX_PARALLEL_PER_PROJECT)
+                ),
+            ):
                 continue
             thread = threading.Thread(
                 target=self.process_job,
@@ -1110,8 +1421,15 @@ class OrchestratorService:
         try:
             self._process_job(issue_key)
         except Exception as exc:  # pragma: no cover - defensive logging path
-            self.store.update_job(issue_key, state="failed", latest_error=str(exc), active_pid=None)
-            self.refresh_issue_report(issue_key, extra_notice=f"Failed: {exc}")
+            outcome = retry_transient_or_fail_issue_job(
+                self.store,
+                self.settings,
+                issue_key,
+                reason=str(exc),
+                backlog=True,
+            )
+            notice = "Retrying transient failure" if outcome == "queued" else "Failed"
+            self.refresh_issue_report(issue_key, extra_notice=f"{notice}: {exc}")
         finally:
             job = self.store.get_job(issue_key)
             if job:
@@ -1150,6 +1468,15 @@ class OrchestratorService:
                 issue_summary=str(issue["fields"].get("summary", issue_key)),
                 issue_description=extract_jira_text(issue["fields"].get("description")),
             )
+            contract = normalize_task_contract(plan, issue_key=issue_key)
+            plan["task_contract"] = contract
+            self.store.record_contract(
+                issue_key,
+                batch_id=str(job.get("batch_id", "")),
+                round_number=0,
+                contract=contract,
+                created_by="claude",
+            )
             self.store.record_step(issue_key, "planning", "success", plan)
             if self._maybe_pause_or_cancel(issue_key):
                 return
@@ -1165,6 +1492,28 @@ class OrchestratorService:
             if plan_step:
                 with contextlib.suppress(json.JSONDecodeError):
                     plan_payload = json.loads(plan_step["payload_json"])
+            contract = normalize_task_contract(
+                plan_payload if isinstance(plan_payload, dict) else {},
+                issue_key=issue_key,
+            )
+            if getattr(self.settings, "contract_handshake", DEFAULT_CONTRACT_HANDSHAKE) == "required":
+                baton = run_contract_handshake(
+                    self.store,
+                    self.settings,
+                    Path(job["worktree_path"]),
+                    issue_key,
+                    project_key,
+                    str(job.get("batch_id", "")),
+                    contract,
+                )
+                self.store.record_step(issue_key, "contract_handshake", baton["status"], baton)
+                if baton["status"] != "approved":
+                    self.store.update_job(issue_key, state="blocked", latest_error=baton.get("summary", "Contract handshake blocked."))
+                    self.refresh_issue_report(issue_key)
+                    return
+                contract = baton["task_contract"]
+                if isinstance(plan_payload, dict):
+                    plan_payload["task_contract"] = contract
             exec_result = run_codex_exec(
                 self.store,
                 self.settings,
@@ -1177,21 +1526,31 @@ class OrchestratorService:
             self.store.record_step(issue_key, "coding", exec_result["status"], exec_result)
             self.store.update_job(issue_key, latest_commit=git_head(Path(job["worktree_path"])))
             if exec_result["status"] not in {"success", "fallback"}:
-                terminal_state = "blocked" if exec_result["status"] == "blocked" else "failed"
-                self.store.update_job(
-                    issue_key,
-                    state=terminal_state,
-                    latest_error=exec_result.get("summary", "Codex exec failed"),
-                )
+                if exec_result["status"] == "blocked":
+                    self.store.update_job(
+                        issue_key,
+                        state="blocked",
+                        latest_error=exec_result.get("summary", "Codex exec blocked"),
+                    )
+                else:
+                    retry_transient_or_fail_issue_job(
+                        self.store,
+                        self.settings,
+                        issue_key,
+                        reason=exec_result.get("summary", "Codex exec failed"),
+                        backlog=True,
+                    )
                 self.refresh_issue_report(issue_key)
                 return
             if exec_result.get("toolchain_recovery"):
                 self.refresh_issue_report(issue_key)
             if not exec_result.get("changed_files"):
-                self.store.update_job(
+                retry_transient_or_fail_issue_job(
+                    self.store,
+                    self.settings,
                     issue_key,
-                    state="blocked",
-                    latest_error="Codex finished without producing a diff.",
+                    reason="Codex finished without producing a diff.",
+                    backlog=True,
                 )
                 self.refresh_issue_report(issue_key)
                 return
@@ -1330,6 +1689,28 @@ class OrchestratorService:
                     codex_review_mode=codex_review_mode,
                 )
                 updates.update(extra_updates)
+                if state == "blocked" and "Codex review did not arrive" in str(updates.get("latest_error", "")):
+                    fresh_pr = github_pull_request_status(worktree_path, job["branch"], str(updates.get("pr_number", "")))
+                    if fresh_pr:
+                        fresh_review_summary = summarize_reviews(
+                            fresh_pr.get("reviews", []),
+                            self.settings.codex_review_authors,
+                            fresh_pr.get("comments", []),
+                        )
+                        if fresh_review_summary["reviewed"]:
+                            pr = fresh_pr
+                            review_summary = fresh_review_summary
+                            state = "ready_for_merge"
+                            updates.pop("latest_error", None)
+                            updates["pr_url"] = pr["url"]
+                            updates["pr_number"] = str(pr["number"])
+                            updates["latest_commit"] = pr.get("headRefOid", updates.get("latest_commit", ""))
+            if state == "ready_for_merge" and getattr(self.settings, "github_merge_policy", DEFAULT_GITHUB_MERGE_POLICY) == "merge_queue":
+                merge_result = ensure_github_auto_merge(worktree_path, pr.get("url", ""))
+                if merge_result.get("warning"):
+                    self.store.record_step(job["issue_key"], "merge_queue", "warning", merge_result)
+                elif merge_result.get("enabled"):
+                    self.store.record_step(job["issue_key"], "merge_queue", "success", merge_result)
             updates["state"] = state
             self.store.update_job(job["issue_key"], **updates)
             self.refresh_issue_report(
@@ -1502,6 +1883,11 @@ class OrchestratorStore:
                     project_key TEXT NOT NULL,
                     repo_path TEXT NOT NULL,
                     state TEXT NOT NULL,
+                    batch_id TEXT DEFAULT '',
+                    conflict_group TEXT DEFAULT '',
+                    dependencies_json TEXT DEFAULT '[]',
+                    attempt_count INTEGER DEFAULT 0,
+                    contract_rounds INTEGER DEFAULT 0,
                     status_name TEXT DEFAULT '',
                     summary TEXT DEFAULT '',
                     branch TEXT DEFAULT '',
@@ -1521,6 +1907,76 @@ class OrchestratorStore:
                     repo_path TEXT PRIMARY KEY,
                     issue_key TEXT NOT NULL,
                     acquired_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS scheduler_leases (
+                    repo_path TEXT NOT NULL,
+                    issue_key TEXT PRIMARY KEY,
+                    project_key TEXT NOT NULL,
+                    conflict_group TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduler_leases_conflict
+                    ON scheduler_leases(repo_path, conflict_group);
+                CREATE TABLE IF NOT EXISTS batches (
+                    batch_id TEXT PRIMARY KEY,
+                    project_key TEXT NOT NULL,
+                    jql TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    max_parallel INTEGER NOT NULL,
+                    summary TEXT DEFAULT '',
+                    design_memo TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS work_units (
+                    issue_key TEXT PRIMARY KEY,
+                    batch_id TEXT NOT NULL,
+                    project_key TEXT NOT NULL,
+                    repo_path TEXT NOT NULL,
+                    conflict_group TEXT NOT NULL,
+                    dependencies_json TEXT DEFAULT '[]',
+                    contract_json TEXT DEFAULT '{}',
+                    state TEXT NOT NULL DEFAULT 'queued',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS contracts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_key TEXT NOT NULL,
+                    batch_id TEXT DEFAULT '',
+                    round INTEGER NOT NULL,
+                    contract_json TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_key TEXT NOT NULL,
+                    batch_id TEXT DEFAULT '',
+                    sender TEXT NOT NULL,
+                    message_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_key TEXT NOT NULL,
+                    batch_id TEXT DEFAULT '',
+                    round INTEGER NOT NULL,
+                    decision TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_key TEXT NOT NULL,
+                    batch_id TEXT DEFAULT '',
+                    attempt INTEGER NOT NULL,
+                    step_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    classification TEXT DEFAULT '',
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS steps (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1590,6 +2046,14 @@ class OrchestratorStore:
                 "review_fallback_requested_at",
                 "TEXT DEFAULT ''",
             )
+            for name, definition in (
+                ("batch_id", "TEXT DEFAULT ''"),
+                ("conflict_group", "TEXT DEFAULT ''"),
+                ("dependencies_json", "TEXT DEFAULT '[]'"),
+                ("attempt_count", "INTEGER DEFAULT 0"),
+                ("contract_rounds", "INTEGER DEFAULT 0"),
+            ):
+                self._ensure_column(connection, "jobs", name, definition)
 
     def _ensure_column(self, connection: sqlite3.Connection, table: str, name: str, definition: str) -> None:
         existing = {
@@ -1734,6 +2198,203 @@ class OrchestratorStore:
             "created_at": str(row["created_at"]),
         }
 
+    def create_batch(
+        self,
+        *,
+        batch_id: str,
+        project_key: str,
+        jql: str,
+        max_parallel: int,
+        summary: str,
+        design_memo: str,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO batches (
+                    batch_id, project_key, jql, state, max_parallel, summary, design_memo, created_at, updated_at
+                ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
+                ON CONFLICT(batch_id) DO UPDATE SET
+                    state=excluded.state,
+                    max_parallel=excluded.max_parallel,
+                    summary=excluded.summary,
+                    design_memo=excluded.design_memo,
+                    updated_at=excluded.updated_at
+                """,
+                (batch_id, project_key, jql, max_parallel, summary, design_memo, now_iso(), now_iso()),
+            )
+
+    def update_batch_state(self, batch_id: str, state: str) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE batches SET state = ?, updated_at = ? WHERE batch_id = ?",
+                (state, now_iso(), batch_id),
+            )
+
+    def batch(self, batch_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM batches WHERE batch_id = ?", (batch_id,)).fetchone()
+            return dict(row) if row else {}
+
+    def list_batches(self, batch_id: str | None = None) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        query = "SELECT * FROM batches"
+        if batch_id:
+            query += " WHERE batch_id = ?"
+            params.append(batch_id)
+        query += " ORDER BY updated_at DESC"
+        with self._connection() as connection:
+            batches = [dict(row) for row in connection.execute(query, params).fetchall()]
+        for batch in batches:
+            batch["jobs"] = self.list_jobs_for_batch(str(batch["batch_id"]))
+        return batches
+
+    def upsert_work_unit(
+        self,
+        *,
+        issue_key: str,
+        batch_id: str,
+        project_key: str,
+        repo_path: str,
+        conflict_group: str,
+        dependencies: list[str],
+        contract: dict[str, Any],
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO work_units (
+                    issue_key, batch_id, project_key, repo_path, conflict_group,
+                    dependencies_json, contract_json, state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                ON CONFLICT(issue_key) DO UPDATE SET
+                    batch_id=excluded.batch_id,
+                    project_key=excluded.project_key,
+                    repo_path=excluded.repo_path,
+                    conflict_group=excluded.conflict_group,
+                    dependencies_json=excluded.dependencies_json,
+                    contract_json=excluded.contract_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    issue_key,
+                    batch_id,
+                    project_key,
+                    repo_path,
+                    conflict_group,
+                    json.dumps(dependencies, ensure_ascii=False),
+                    json.dumps(contract, ensure_ascii=False),
+                    now_iso(),
+                    now_iso(),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE jobs
+                SET batch_id=?, conflict_group=?, dependencies_json=?, updated_at=?
+                WHERE issue_key=?
+                """,
+                (batch_id, conflict_group, json.dumps(dependencies, ensure_ascii=False), now_iso(), issue_key),
+            )
+
+    def list_jobs_for_batch(self, batch_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM jobs WHERE batch_id = ? ORDER BY created_at ASC",
+                (batch_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def record_contract(
+        self,
+        issue_key: str,
+        *,
+        batch_id: str,
+        round_number: int,
+        contract: dict[str, Any],
+        created_by: str,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO contracts (issue_key, batch_id, round, contract_json, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (issue_key, batch_id, round_number, json.dumps(contract, ensure_ascii=False), created_by, now_iso()),
+            )
+
+    def record_message(
+        self,
+        issue_key: str,
+        *,
+        batch_id: str,
+        sender: str,
+        message_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO messages (issue_key, batch_id, sender, message_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (issue_key, batch_id, sender, message_type, json.dumps(payload, ensure_ascii=False), now_iso()),
+            )
+
+    def record_decision(
+        self,
+        issue_key: str,
+        *,
+        batch_id: str,
+        round_number: int,
+        decision: dict[str, Any],
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO decisions (issue_key, batch_id, round, decision, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    issue_key,
+                    batch_id,
+                    round_number,
+                    str(decision.get("decision", "")),
+                    json.dumps(decision, ensure_ascii=False),
+                    now_iso(),
+                ),
+            )
+
+    def record_attempt(
+        self,
+        issue_key: str,
+        *,
+        batch_id: str,
+        attempt: int,
+        step_name: str,
+        status: str,
+        classification: str,
+        payload: dict[str, Any],
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO attempts (
+                    issue_key, batch_id, attempt, step_name, status, classification, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    issue_key,
+                    batch_id,
+                    attempt,
+                    step_name,
+                    status,
+                    classification,
+                    json.dumps(payload, ensure_ascii=False),
+                    now_iso(),
+                ),
+            )
+
     def enqueue_issue(
         self,
         *,
@@ -1827,7 +2488,58 @@ class OrchestratorStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def acquire_lease(self, repo_path: str, issue_key: str) -> bool:
+    def acquire_lease(
+        self,
+        repo_path: str,
+        issue_key: str,
+        *,
+        project_key: str = "",
+        conflict_group: str = "",
+        max_parallel_per_repo: int = 1,
+        max_parallel_per_project: int = 1,
+    ) -> bool:
+        if max_parallel_per_repo <= 1 and max_parallel_per_project <= 1 and not conflict_group:
+            return self._acquire_legacy_lease(repo_path, issue_key)
+        group = conflict_group or issue_key
+        project = project_key or str((self.get_job(issue_key) or {}).get("project_key", ""))
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT issue_key FROM scheduler_leases WHERE issue_key = ?",
+                (issue_key,),
+            ).fetchone()
+            if existing:
+                return True
+            repo_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM scheduler_leases WHERE repo_path = ?",
+                (repo_path,),
+            ).fetchone()["count"]
+            if int(repo_count) >= max_parallel_per_repo:
+                return False
+            project_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM scheduler_leases WHERE project_key = ?",
+                (project,),
+            ).fetchone()["count"]
+            if int(project_count) >= max_parallel_per_project:
+                return False
+            conflict = connection.execute(
+                """
+                SELECT issue_key FROM scheduler_leases
+                WHERE repo_path = ? AND conflict_group = ? AND issue_key != ?
+                """,
+                (repo_path, group, issue_key),
+            ).fetchone()
+            if conflict:
+                return False
+            connection.execute(
+                """
+                INSERT INTO scheduler_leases (repo_path, issue_key, project_key, conflict_group, acquired_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (repo_path, issue_key, project, group, now_iso()),
+            )
+        return True
+
+    def _acquire_legacy_lease(self, repo_path: str, issue_key: str) -> bool:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT issue_key FROM leases WHERE repo_path = ?",
@@ -1855,10 +2567,15 @@ class OrchestratorStore:
                 "DELETE FROM leases WHERE repo_path = ? AND issue_key = ?",
                 (repo_path, issue_key),
             )
+            connection.execute(
+                "DELETE FROM scheduler_leases WHERE repo_path = ? AND issue_key = ?",
+                (repo_path, issue_key),
+            )
 
     def clear_all_leases(self) -> None:
         with self._connection() as connection:
             connection.execute("DELETE FROM leases")
+            connection.execute("DELETE FROM scheduler_leases")
 
     def recover_inflight_jobs(self) -> None:
         with self._connection() as connection:
@@ -2053,6 +2770,14 @@ def load_worker_settings(
     codex_review_authors = tuple(
         dict.fromkeys([*configured_codex_review_authors, *DEFAULT_CODEX_REVIEW_AUTHORS])
     )
+    scheduler_config = config.get("scheduler", {})
+    timeout_config = config.get("timeouts", {})
+    failure_config = config.get("failure", {})
+    backlog_statuses = tuple(
+        str(item).strip()
+        for item in failure_config.get("backlog_statuses", DEFAULT_FAILURE_BACKLOG_STATUSES)
+        if str(item).strip()
+    )
     return WorkerSettings(
         config_path=config_path,
         db_path=state_dir / DB_FILENAME,
@@ -2072,6 +2797,22 @@ def load_worker_settings(
                 "fallback_review_grace_seconds",
                 DEFAULT_FALLBACK_REVIEW_GRACE_SECONDS,
             )
+        ),
+        max_parallel_per_repo=max(1, int(scheduler_config.get("max_parallel_per_repo", DEFAULT_MAX_PARALLEL_PER_REPO))),
+        max_parallel_per_project=max(
+            1,
+            int(scheduler_config.get("max_parallel_per_project", DEFAULT_MAX_PARALLEL_PER_PROJECT)),
+        ),
+        contract_handshake=str(scheduler_config.get("contract_handshake", DEFAULT_CONTRACT_HANDSHAKE)),
+        max_baton_rounds=max(0, int(scheduler_config.get("max_baton_rounds", DEFAULT_MAX_BATON_ROUNDS))),
+        failure_max_attempts=max(1, int(failure_config.get("max_attempts", DEFAULT_FAILURE_MAX_ATTEMPTS))),
+        failure_backlog_statuses=backlog_statuses or DEFAULT_FAILURE_BACKLOG_STATUSES,
+        github_merge_policy=str(config.get("github", {}).get("merge_policy", DEFAULT_GITHUB_MERGE_POLICY)),
+        claude_timeout_seconds=max(1, int(timeout_config.get("claude_seconds", DEFAULT_CLAUDE_TIMEOUT_SECONDS))),
+        codex_exec_timeout_seconds=max(1, int(timeout_config.get("codex_exec_seconds", DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS))),
+        codex_review_timeout_seconds=max(
+            1,
+            int(timeout_config.get("codex_review_seconds", DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS)),
         ),
         codex_model=str(config.get("ai", {}).get("codex_model", DEFAULT_CODEX_MODEL)).strip(),
         codex_binary=codex_binary,
@@ -2101,7 +2842,17 @@ def load_orchestrator_config(config_path: Path | None = None) -> dict[str, Any]:
                 {
                     key: value
                     for key, value in loaded.items()
-                    if key not in {"poll_intervals", "github", "ai", "listen_url", "shared_secret"}
+                    if key
+                    not in {
+                        "poll_intervals",
+                        "github",
+                        "ai",
+                        "scheduler",
+                        "timeouts",
+                        "failure",
+                        "listen_url",
+                        "shared_secret",
+                    }
                 }
             )
             if isinstance(loaded.get("poll_intervals"), dict):
@@ -2118,6 +2869,21 @@ def load_orchestrator_config(config_path: Path | None = None) -> dict[str, Any]:
                 config["ai"] = {
                     **config["ai"],
                     **loaded["ai"],
+                }
+            if isinstance(loaded.get("scheduler"), dict):
+                config["scheduler"] = {
+                    **config["scheduler"],
+                    **loaded["scheduler"],
+                }
+            if isinstance(loaded.get("timeouts"), dict):
+                config["timeouts"] = {
+                    **config["timeouts"],
+                    **loaded["timeouts"],
+                }
+            if isinstance(loaded.get("failure"), dict):
+                config["failure"] = {
+                    **config["failure"],
+                    **loaded["failure"],
                 }
             if loaded.get("listen_url"):
                 apply_legacy_listen_url(config, str(loaded["listen_url"]))
@@ -2160,6 +2926,22 @@ def default_orchestrator_config() -> dict[str, Any]:
             "codex_review_authors": list(DEFAULT_CODEX_REVIEW_AUTHORS),
             "auto_review_grace_seconds": DEFAULT_AUTO_REVIEW_GRACE_SECONDS,
             "fallback_review_grace_seconds": DEFAULT_FALLBACK_REVIEW_GRACE_SECONDS,
+            "merge_policy": DEFAULT_GITHUB_MERGE_POLICY,
+        },
+        "scheduler": {
+            "max_parallel_per_repo": DEFAULT_MAX_PARALLEL_PER_REPO,
+            "max_parallel_per_project": DEFAULT_MAX_PARALLEL_PER_PROJECT,
+            "contract_handshake": DEFAULT_CONTRACT_HANDSHAKE,
+            "max_baton_rounds": DEFAULT_MAX_BATON_ROUNDS,
+        },
+        "timeouts": {
+            "claude_seconds": DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+            "codex_exec_seconds": DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
+            "codex_review_seconds": DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS,
+        },
+        "failure": {
+            "max_attempts": DEFAULT_FAILURE_MAX_ATTEMPTS,
+            "backlog_statuses": list(DEFAULT_FAILURE_BACKLOG_STATUSES),
         },
         "ai": {
             "codex_model": DEFAULT_CODEX_MODEL,
@@ -2635,6 +3417,37 @@ def transition_jira_issue_for_job(
         }
 
 
+def transition_jira_issue_to_aliases(
+    settings: WorkerSettings,
+    issue_key: str,
+    aliases: tuple[str, ...] | list[str],
+) -> dict[str, Any]:
+    normalized_aliases = tuple(str(alias).strip() for alias in aliases if str(alias).strip())
+    if not normalized_aliases:
+        return {"transitioned": False, "status_name": ""}
+    try:
+        current_status = jira_issue_current_status(settings, issue_key)
+        if status_name_matches_aliases(current_status, normalized_aliases):
+            return {"transitioned": False, "status_name": current_status}
+        transition = select_transition_for_aliases(jira_issue_transitions(settings, issue_key), normalized_aliases)
+        if not transition:
+            return {
+                "transitioned": False,
+                "status_name": current_status,
+                "warning": f"No Jira transition available from `{current_status}` to one of: {', '.join(normalized_aliases)}.",
+            }
+        target_status = str(transition.get("to", {}).get("name") or transition.get("name") or normalized_aliases[0])
+        jira_transition_issue(settings, issue_key, str(transition["id"]))
+        return {
+            "transitioned": True,
+            "status_name": target_status,
+            "transition_id": str(transition["id"]),
+            "target_status": target_status,
+        }
+    except Exception as exc:
+        return {"transitioned": False, "status_name": "", "warning": f"Jira transition warning: {exc}"}
+
+
 def jira_search_auto_issues(settings: WorkerSettings, project_key: str) -> list[dict[str, Any]]:
     jql = (
         f'project = {project_key} AND labels = "{START_LABEL}" '
@@ -2652,6 +3465,185 @@ def jira_search_auto_issues(settings: WorkerSettings, project_key: str) -> list[
         },
     )
     return list(payload.get("issues", [])) if isinstance(payload, dict) else []
+
+
+def jira_search_jql(settings: WorkerSettings, jql: str, *, max_results: int = 50) -> list[dict[str, Any]]:
+    payload = jira_request(
+        settings=settings,
+        method="POST",
+        path="/rest/api/3/search/jql",
+        payload={
+            "jql": jql,
+            "fields": ["summary", "status", "labels"],
+            "maxResults": max_results,
+        },
+    )
+    return list(payload.get("issues", [])) if isinstance(payload, dict) else []
+
+
+def create_batch_from_jql(
+    *,
+    store: OrchestratorStore,
+    settings: WorkerSettings,
+    project_key: str,
+    jql: str,
+    max_parallel: int,
+) -> dict[str, Any]:
+    project = store.project(project_key)
+    if not project:
+        raise OrchestratorError(f"Project is not registered with the orchestrator: {project_key}")
+    issues = jira_search_jql(settings, jql)
+    issue_summaries = [
+        {
+            "issue_key": str(issue.get("key", "")),
+            "summary": str(issue.get("fields", {}).get("summary", "")),
+            "status": str(issue.get("fields", {}).get("status", {}).get("name", "")),
+        }
+        for issue in issues
+        if normalize_issue_key(issue.get("key"))
+    ]
+    if not issue_summaries:
+        raise OrchestratorError("Batch JQL returned no issues.")
+    batch_id = f"{project_key}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    plan = run_claude_batch_plan(
+        store=store,
+        settings=settings,
+        project=project,
+        batch_id=batch_id,
+        jql=jql,
+        issues=issue_summaries,
+        max_parallel=max_parallel,
+    )
+    store.create_batch(
+        batch_id=batch_id,
+        project_key=project_key,
+        jql=jql,
+        max_parallel=max_parallel,
+        summary=str(plan.get("summary", "")),
+        design_memo=str(plan.get("design_memo", "")),
+    )
+    planned_units = {str(item.get("issue_key", "")).upper(): item for item in plan.get("work_units", []) if isinstance(item, dict)}
+    for issue in issue_summaries:
+        issue_key = str(issue["issue_key"]).upper()
+        unit = planned_units.get(issue_key, {})
+        contract = normalize_task_contract(
+            unit.get("task_contract") if isinstance(unit.get("task_contract"), dict) else {
+                "issue_key": issue_key,
+                "goal": issue["summary"],
+                "files_in_scope": [],
+                "constraints": [],
+                "dependencies": unit.get("dependencies", []),
+            },
+            issue_key=issue_key,
+        )
+        dependencies = list_of_strings(unit.get("dependencies") or contract.get("dependencies") or [])
+        conflict_group = str(unit.get("conflict_group") or derive_conflict_group(contract) or issue_key)
+        store.enqueue_issue(
+            project_key=project_key,
+            repo_path=str(project["repo_path"]),
+            issue_key=issue_key,
+            status=str(issue["status"]),
+            summary=str(issue["summary"]),
+        )
+        store.upsert_work_unit(
+            issue_key=issue_key,
+            batch_id=batch_id,
+            project_key=project_key,
+            repo_path=str(project["repo_path"]),
+            conflict_group=conflict_group,
+            dependencies=dependencies,
+            contract=contract,
+        )
+        store.record_contract(
+            issue_key,
+            batch_id=batch_id,
+            round_number=0,
+            contract=contract,
+            created_by="claude-batch",
+        )
+    return {"batch_id": batch_id, "project_key": project_key, "issue_count": len(issue_summaries), "plan": plan}
+
+
+def run_claude_batch_plan(
+    *,
+    store: OrchestratorStore,
+    settings: WorkerSettings,
+    project: dict[str, Any],
+    batch_id: str,
+    jql: str,
+    issues: list[dict[str, str]],
+    max_parallel: int,
+) -> dict[str, Any]:
+    schema = REPO_ROOT / "schemas" / "orchestrator" / "batch-plan.json"
+    prompt = f"""
+You are the Claude coordinator for a multi-issue development batch.
+
+Create a DAG plan that lets Codex workers implement independent issues in parallel without design drift.
+
+Project: {project.get("project_key")}
+Batch: {batch_id}
+JQL: {jql}
+Max parallel: {max_parallel}
+
+Rules:
+- Keep 1 issue = 1 worktree = 1 branch = 1 PR.
+- Assign the same conflict_group to issues likely to touch the same files, protected paths, schema, or shared API.
+- Use dependencies when one issue must wait for another PR to merge.
+- Produce a task_contract for each issue.
+
+Issues:
+{json.dumps(issues, indent=2, ensure_ascii=False)}
+
+Return JSON only and match the schema.
+""".strip()
+    try:
+        result = run_claude_json(
+            settings=settings,
+            store=store,
+            issue_key=str(issues[0]["issue_key"]),
+            cwd=Path(str(project["repo_path"])),
+            prompt=prompt,
+            schema_path=schema,
+        )
+        result["status"] = "success"
+        return result
+    except Exception as exc:
+        return fallback_batch_plan(issues, reason=str(exc))
+
+
+def fallback_batch_plan(issues: list[dict[str, str]], *, reason: str) -> dict[str, Any]:
+    return {
+        "summary": f"Fallback deterministic batch plan used: {reason}",
+        "design_memo": "Claude batch planning failed; each issue is treated as independent unless its contract declares dependencies.",
+        "work_units": [
+            {
+                "issue_key": issue["issue_key"],
+                "conflict_group": issue["issue_key"],
+                "dependencies": [],
+                "task_contract": {
+                    "issue_key": issue["issue_key"],
+                    "goal": issue["summary"],
+                    "acceptance_criteria": [],
+                    "files_in_scope": [],
+                    "out_of_scope": [],
+                    "constraints": [],
+                    "validation_commands": [],
+                    "risk_flags": ["fallback_batch_plan"],
+                    "dependencies": [],
+                },
+            }
+            for issue in issues
+        ],
+    }
+
+
+def derive_conflict_group(contract: dict[str, Any]) -> str:
+    files = list_of_strings(contract.get("files_in_scope"))
+    if not files:
+        return ""
+    first = files[0].replace("\\", "/")
+    parts = [part for part in first.split("/") if part]
+    return "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
 
 
 def jira_get_issue(settings: WorkerSettings, issue_key: str) -> dict[str, Any]:
@@ -2849,18 +3841,30 @@ def jira_request_raw(
         headers["Content-Type"] = "application/json"
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = request.Request(url, data=data, headers=headers, method=method.upper())
-    try:
-        with request.urlopen(req) as response:
-            content = response.read().decode("utf-8")
-            if not content:
-                return {}
-            return json.loads(content)
-    except error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise JiraRequestError(
-            f"Jira request failed ({method} {path}): {exc.code} {body}",
-            status_code=exc.code,
-        ) from exc
+    last_error: Exception | None = None
+    for attempt in range(DEFAULT_API_RETRY_ATTEMPTS):
+        try:
+            with request.urlopen(req, timeout=30) as response:
+                content = response.read().decode("utf-8")
+                if not content:
+                    return {}
+                return json.loads(content)
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            last_error = JiraRequestError(
+                f"Jira request failed ({method} {path}): {exc.code} {body}",
+                status_code=exc.code,
+            )
+            if exc.code not in TRANSIENT_HTTP_STATUSES or attempt == DEFAULT_API_RETRY_ATTEMPTS - 1:
+                raise last_error from exc
+        except error.URLError as exc:
+            last_error = OrchestratorError(f"Jira request failed ({method} {path}): {exc.reason}")
+            if attempt == DEFAULT_API_RETRY_ATTEMPTS - 1:
+                raise last_error from exc
+        time.sleep(api_retry_delay(attempt))
+    if last_error:
+        raise last_error
+    return {}
 
 
 def jira_cloud_id(settings: WorkerSettings) -> str:
@@ -3249,6 +4253,170 @@ Output requirements:
     return result
 
 
+def normalize_task_contract(plan_payload: dict[str, Any], *, issue_key: str) -> dict[str, Any]:
+    existing = plan_payload.get("task_contract")
+    if isinstance(existing, dict):
+        contract = dict(existing)
+    else:
+        contract = {
+            "issue_key": issue_key,
+            "goal": str(plan_payload.get("goal") or plan_payload.get("summary") or issue_key),
+            "acceptance_criteria": list_of_strings(plan_payload.get("acceptance_criteria") or []),
+            "files_in_scope": list_of_strings(plan_payload.get("files_in_scope") or []),
+            "out_of_scope": list_of_strings(plan_payload.get("out_of_scope") or []),
+            "constraints": list_of_strings(plan_payload.get("constraints") or []),
+            "validation_commands": list_of_strings(plan_payload.get("validation_commands") or []),
+            "risk_flags": list_of_strings(plan_payload.get("risk_flags") or []),
+            "dependencies": list_of_strings(plan_payload.get("dependencies") or []),
+        }
+    contract["issue_key"] = str(contract.get("issue_key") or issue_key).upper()
+    for key in (
+        "acceptance_criteria",
+        "files_in_scope",
+        "out_of_scope",
+        "constraints",
+        "validation_commands",
+        "risk_flags",
+        "dependencies",
+    ):
+        contract[key] = list_of_strings(contract.get(key))
+    contract["goal"] = str(contract.get("goal") or issue_key)
+    return contract
+
+
+def list_of_strings(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def run_contract_handshake(
+    store: OrchestratorStore,
+    settings: WorkerSettings,
+    worktree_path: Path,
+    issue_key: str,
+    project_key: str,
+    batch_id: str,
+    task_contract: dict[str, Any],
+) -> dict[str, Any]:
+    contract = dict(task_contract)
+    max_rounds = int(getattr(settings, "max_baton_rounds", DEFAULT_MAX_BATON_ROUNDS))
+    for round_number in range(1, max_rounds + 1):
+        understanding = run_codex_understanding(
+            store,
+            settings,
+            worktree_path,
+            project_key,
+            issue_key,
+            contract,
+        )
+        store.record_message(
+            issue_key,
+            batch_id=batch_id,
+            sender="codex",
+            message_type="task_understanding",
+            payload=understanding,
+        )
+        if understanding.get("changed_files"):
+            return {
+                "status": "blocked",
+                "summary": "Codex changed files during the read-only understanding stage.",
+                "task_contract": contract,
+                "round": round_number,
+            }
+        decision = run_claude_coordinator_decision(
+            store,
+            settings,
+            worktree_path,
+            issue_key,
+            project_key,
+            contract,
+            understanding,
+        )
+        store.record_decision(
+            issue_key,
+            batch_id=batch_id,
+            round_number=round_number,
+            decision=decision,
+        )
+        if decision.get("decision") == "approved":
+            return {
+                "status": "approved",
+                "summary": decision.get("summary", "Contract approved."),
+                "task_contract": contract,
+                "round": round_number,
+            }
+        if decision.get("decision") == "revise_contract":
+            contract = normalize_task_contract(
+                decision.get("task_contract") if isinstance(decision.get("task_contract"), dict) else contract,
+                issue_key=issue_key,
+            )
+            store.record_contract(
+                issue_key,
+                batch_id=batch_id,
+                round_number=round_number,
+                contract=contract,
+                created_by="claude",
+            )
+            continue
+        return {
+            "status": "blocked",
+            "summary": decision.get("blocker") or decision.get("summary") or "Contract handshake blocked.",
+            "task_contract": contract,
+            "round": round_number,
+        }
+    return {
+        "status": "blocked",
+        "summary": f"Contract handshake exceeded max baton rounds ({max_rounds}).",
+        "task_contract": contract,
+        "round": max_rounds,
+    }
+
+
+def run_claude_coordinator_decision(
+    store: OrchestratorStore,
+    settings: WorkerSettings,
+    worktree_path: Path,
+    issue_key: str,
+    project_key: str,
+    task_contract: dict[str, Any],
+    understanding: dict[str, Any],
+) -> dict[str, Any]:
+    schema = REPO_ROOT / "schemas" / "orchestrator" / "coordinator-decision.json"
+    prompt = f"""
+You are the Claude coordinator for a mediated Claude-Codex baton.
+
+Issue: {issue_key}
+Project: {project_key}
+
+Decide whether Codex understood the task before implementation.
+- approved: Codex may implement exactly this contract.
+- revise_contract: return a corrected task_contract.
+- split_task: the issue is too broad for one PR.
+- block: unsafe or ambiguous enough to stop.
+
+Task contract:
+{json.dumps(task_contract, indent=2, ensure_ascii=False)}
+
+Codex understanding:
+{json.dumps(understanding, indent=2, ensure_ascii=False)}
+
+Return JSON only and match the schema.
+""".strip()
+    result = run_claude_json(
+        settings=settings,
+        store=store,
+        issue_key=issue_key,
+        cwd=worktree_path,
+        prompt=prompt,
+        schema_path=schema,
+    )
+    result["status"] = "success"
+    return result
+
+
 def run_claude_integrate(
     store: OrchestratorStore,
     settings: WorkerSettings,
@@ -3319,13 +4487,98 @@ def run_claude_json(
         issue_key,
         argv,
         cwd=cwd,
-        timeout_seconds=DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+        timeout_seconds=int(getattr(settings, "claude_timeout_seconds", DEFAULT_CLAUDE_TIMEOUT_SECONDS)),
     )
     payload = json.loads(result.stdout)
     structured = payload.get("structured_output")
     if not isinstance(structured, dict):
         raise OrchestratorError("Claude did not return structured_output.")
     return structured
+
+
+def run_codex_understanding(
+    store: OrchestratorStore,
+    settings: WorkerSettings,
+    worktree_path: Path,
+    project_key: str,
+    issue_key: str,
+    task_contract: dict[str, Any],
+) -> dict[str, Any]:
+    schema = REPO_ROOT / "schemas" / "orchestrator" / "task-understanding.json"
+    output_file = issue_state_dir(project_key, issue_key) / "codex.understanding.json"
+    if output_file.exists():
+        output_file.unlink()
+    prompt = f"""
+Read the task contract and return your understanding before implementation.
+
+Rules:
+- Do not edit, create, delete, move, stage, or commit files.
+- Do not open a PR.
+- Report ambiguity and risky assumptions explicitly.
+- Return JSON matching the provided schema.
+
+Task contract:
+{json.dumps(task_contract, indent=2, ensure_ascii=False)}
+""".strip()
+    try:
+        argv = codex_exec_argv(settings)
+    except OrchestratorError as exc:
+        return {
+            "summary": f"Codex CLI unavailable: {exc}",
+            "understood_scope": "",
+            "planned_files": [],
+            "ambiguities": [str(exc)],
+            "risky_assumptions": [],
+            "validation_plan": [],
+            "changed_files": git_changed_files(worktree_path),
+            "status": "blocked",
+        }
+    argv.extend(
+        [
+            "--json",
+            "--output-schema",
+            str(schema),
+            "--output-last-message",
+            str(output_file),
+            "--cd",
+            str(worktree_path),
+            prompt,
+        ]
+    )
+    process = start_process(argv, cwd=worktree_path)
+    store.update_job(issue_key, active_pid=process.pid)
+    try:
+        stdout, stderr, timed_out = communicate_or_terminate(
+            process,
+            timeout_seconds=int(getattr(settings, "codex_review_timeout_seconds", DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS)),
+        )
+    finally:
+        store.update_job(issue_key, active_pid=None)
+    changed_files = git_changed_files(worktree_path)
+    payload: dict[str, Any] = {
+        "summary": summarize_codex_jsonl(stdout) or "Codex understanding completed.",
+        "understood_scope": "",
+        "planned_files": [],
+        "ambiguities": [],
+        "risky_assumptions": [],
+        "validation_plan": [],
+        "changed_files": changed_files,
+        "status": status_from_process(process.returncode, timed_out=timed_out, has_fallback=False),
+        "exit_code": 124 if timed_out else process.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "timed_out": timed_out,
+    }
+    if output_file.exists():
+        try:
+            structured = json.loads(output_file.read_text(encoding="utf-8"))
+            if isinstance(structured, dict):
+                payload.update(structured)
+        except json.JSONDecodeError:
+            payload["summary"] = output_file.read_text(encoding="utf-8").strip()
+    if timed_out:
+        payload["ambiguities"] = [*list_of_strings(payload.get("ambiguities")), "Codex understanding timed out."]
+    return payload
 
 
 def run_codex_exec(
@@ -3337,7 +4590,7 @@ def run_codex_exec(
     branch: str,
     plan_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    schema = REPO_ROOT / "schemas" / "orchestrator" / "codex-exec.json"
+    schema = REPO_ROOT / "schemas" / "orchestrator" / "task-result.json"
     output_file = issue_state_dir(project_key, issue_key) / "codex.exec.json"
     if output_file.exists():
         output_file.unlink()
@@ -3354,6 +4607,9 @@ Return JSON matching the provided schema.
 
 Claude plan:
 {json.dumps(plan_payload, indent=2, ensure_ascii=False)}
+
+Task contract:
+{json.dumps(normalize_task_contract(plan_payload, issue_key=issue_key), indent=2, ensure_ascii=False)}
 """.strip()
     first = run_codex_exec_attempt(
         store,
@@ -3444,7 +4700,7 @@ def run_codex_exec_attempt(
     try:
         stdout, stderr, timed_out = communicate_or_terminate(
             process,
-            timeout_seconds=DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
+            timeout_seconds=int(getattr(settings, "codex_exec_timeout_seconds", DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS)),
         )
     finally:
         store.update_job(issue_key, active_pid=None)
@@ -3470,13 +4726,22 @@ def run_codex_exec_attempt(
     else:
         payload["summary"] = summarize_codex_jsonl(stdout)
     if timed_out and not payload.get("summary"):
-        payload["summary"] = build_exec_timeout_summary(worktree_path, changed_files)
+        payload["summary"] = build_exec_timeout_summary(
+            worktree_path,
+            changed_files,
+            timeout_seconds=int(getattr(settings, "codex_exec_timeout_seconds", DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS)),
+        )
     if timed_out:
         payload["status"] = status_from_process(process.returncode, timed_out=True, has_fallback=bool(changed_files))
         payload["exit_code"] = 124
         payload["validation_passed"] = False
         payload["fallback_used"] = bool(changed_files)
         payload["timed_out"] = True
+        payload["summary"] = payload.get("summary") or build_exec_timeout_summary(
+            worktree_path,
+            changed_files,
+            timeout_seconds=int(getattr(settings, "codex_exec_timeout_seconds", DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS)),
+        )
     return payload
 
 
@@ -3547,13 +4812,17 @@ def run_codex_review_attempt(
     try:
         stdout, stderr, timed_out = communicate_or_terminate(
             process,
-            timeout_seconds=DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS,
+            timeout_seconds=int(getattr(settings, "codex_review_timeout_seconds", DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS)),
         )
     finally:
         store.update_job(issue_key, active_pid=None)
     changed_files = git_changed_files(worktree_path)
     if timed_out:
-        summary = build_review_timeout_summary(worktree_path, changed_files)
+        summary = build_review_timeout_summary(
+            worktree_path,
+            changed_files,
+            timeout_seconds=int(getattr(settings, "codex_review_timeout_seconds", DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS)),
+        )
         return {
             "status": "fallback",
             "exit_code": 124,
@@ -3691,7 +4960,7 @@ def github_pull_request_status(worktree_path: Path, branch: str, pr_number: str)
         "--json",
         "number,url,state,mergeStateStatus,isDraft,reviews,statusCheckRollup,headRefName,headRefOid,reviewDecision,comments",
     ]
-    result = run_optional(argv, cwd=worktree_path)
+    result = run_optional_with_retry(argv, cwd=worktree_path)
     if not result or result.returncode != 0 or not result.stdout.strip():
         return {}
     return json.loads(result.stdout)
@@ -3968,6 +5237,46 @@ def run_optional(argv: list[str], *, cwd: Path | None = None) -> subprocess.Comp
         return None
 
 
+def run_optional_with_retry(
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    attempts: int = DEFAULT_API_RETRY_ATTEMPTS,
+) -> subprocess.CompletedProcess[str] | None:
+    result: subprocess.CompletedProcess[str] | None = None
+    for attempt in range(attempts):
+        result = run_optional(argv, cwd=cwd)
+        if not result or result.returncode == 0:
+            return result
+        output = f"{result.stdout}\n{result.stderr}".lower()
+        if not is_transient_cli_output(output) or attempt == attempts - 1:
+            return result
+        time.sleep(api_retry_delay(attempt))
+    return result
+
+
+def is_transient_cli_output(output: str) -> bool:
+    fragments = (
+        "could not resolve host",
+        "nodename nor servname",
+        "temporary failure",
+        "connection reset",
+        "connection refused",
+        "timed out",
+        "timeout",
+        "rate limit",
+        "secondary rate limit",
+        "502",
+        "503",
+        "504",
+    )
+    return any(fragment in output for fragment in fragments)
+
+
+def api_retry_delay(attempt: int) -> float:
+    return min(8.0, 0.5 * (2**attempt)) + (0.1 * attempt)
+
+
 def run_command(argv: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
@@ -4064,7 +5373,7 @@ def signal_pid_group(pid: int, signum: signal.Signals) -> None:
 
 def status_from_process(returncode: int | None, *, timed_out: bool, has_fallback: bool) -> str:
     if timed_out and has_fallback:
-        return "fallback"
+        return "partial"
     if returncode == 0:
         return "success"
     return "failed"
@@ -4142,6 +5451,21 @@ def request_codex_review(worktree_path: Path, pr_url: str, *, existing_timestamp
     return existing_timestamp
 
 
+def ensure_github_auto_merge(worktree_path: Path, pr_url: str) -> dict[str, Any]:
+    if not pr_url:
+        return {"enabled": False, "warning": "PR URL is missing; cannot enable GitHub merge queue/auto-merge."}
+    result = run_optional(["gh", "pr", "merge", pr_url, "--auto", "--merge"], cwd=worktree_path)
+    if not result:
+        return {"enabled": False, "warning": "gh is unavailable; cannot enable GitHub merge queue/auto-merge."}
+    output = "\n".join(item for item in (result.stdout.strip(), result.stderr.strip()) if item)
+    if result.returncode != 0:
+        benign = ("already enabled", "already in queue", "pull request is already merged")
+        if any(fragment in output.lower() for fragment in benign):
+            return {"enabled": True, "summary": output or "GitHub merge queue/auto-merge already enabled."}
+        return {"enabled": False, "warning": output or "Could not enable GitHub merge queue/auto-merge."}
+    return {"enabled": True, "summary": output or "GitHub merge queue/auto-merge enabled."}
+
+
 def summarize_codex_jsonl(output: str) -> str:
     summary = ""
     for line in output.splitlines():
@@ -4154,32 +5478,42 @@ def summarize_codex_jsonl(output: str) -> str:
     return summary
 
 
-def build_review_timeout_summary(worktree_path: Path, changed_files: list[str]) -> str:
+def build_review_timeout_summary(
+    worktree_path: Path,
+    changed_files: list[str],
+    *,
+    timeout_seconds: int = DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS,
+) -> str:
     diff_stat = git_cached_diff_stat(worktree_path)
     changed_text = ", ".join(changed_files) if changed_files else "no meaningful files detected"
     if diff_stat:
         return (
-            f"Codex local review timed out after {DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS}s. "
+            f"Codex local review timed out after {timeout_seconds}s. "
             f"Fallback review summary based on staged diff. Changed files: {changed_text}. "
             f"Diff stat: {diff_stat}"
         )
     return (
-        f"Codex local review timed out after {DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS}s. "
+        f"Codex local review timed out after {timeout_seconds}s. "
         f"Fallback review summary based on staged diff. Changed files: {changed_text}."
     )
 
 
-def build_exec_timeout_summary(worktree_path: Path, changed_files: list[str]) -> str:
+def build_exec_timeout_summary(
+    worktree_path: Path,
+    changed_files: list[str],
+    *,
+    timeout_seconds: int = DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
+) -> str:
     diff_stat = git_worktree_diff_stat(worktree_path)
     changed_text = ", ".join(changed_files) if changed_files else "no meaningful files detected"
     if diff_stat:
         return (
-            f"Codex implementation timed out after {DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS}s. "
+            f"Codex implementation timed out after {timeout_seconds}s. "
             f"Fallback execution summary based on current worktree diff. Changed files: {changed_text}. "
             f"Diff stat: {diff_stat}"
         )
     return (
-        f"Codex implementation timed out after {DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS}s. "
+        f"Codex implementation timed out after {timeout_seconds}s. "
         f"Fallback execution summary based on current worktree diff. Changed files: {changed_text}."
     )
 

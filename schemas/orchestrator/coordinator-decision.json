@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "required": [
+    "decision",
+    "summary",
+    "blocker"
+  ],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": ["approved", "revise_contract", "split_task", "block"]
+    },
+    "summary": { "type": "string", "minLength": 1 },
+    "blocker": { "type": "string" },
+    "task_contract": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

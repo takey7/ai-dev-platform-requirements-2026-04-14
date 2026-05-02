@@ -1,0 +1,35 @@
+{
+  "type": "object",
+  "required": [
+    "summary",
+    "design_memo",
+    "work_units"
+  ],
+  "properties": {
+    "summary": { "type": "string", "minLength": 1 },
+    "design_memo": { "type": "string" },
+    "work_units": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "issue_key",
+          "conflict_group",
+          "dependencies",
+          "task_contract"
+        ],
+        "properties": {
+          "issue_key": { "type": "string", "minLength": 1 },
+          "conflict_group": { "type": "string", "minLength": 1 },
+          "dependencies": { "type": "array", "items": { "type": "string" } },
+          "task_contract": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -93,7 +93,7 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
   --issue-project-key PROJ \
   --confluence-space SPACE \
   --source-repo takey7/ai-dev-platform-requirements-2026-04-14 \
-  --version main
+  --version v0.2.0
 ```
 
 `bootstrap` is the canonical platform primitive. `create-project` is a convenience workflow that orchestrates repo creation and then applies the same baseline.
@@ -138,12 +138,13 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
 ```
 
 - worker は single-process + SQLite WAL で state を保持する
-- repo ごとに 1 issue だけ lease を取る
+- repo ごとに最大 3 issue を並列実行する。ただし同じ conflict group / protected path / dependency は同時実行しない
 - `ai:auto` + ready status (`To Do`, `Selected for Development`) の issue を対象にする
 - Jira comments を polling し、`/ai pause`, `/ai resume`, `/ai cancel`, `/ai retry`, `/ai status` を処理する
+- Claude planning -> Codex understanding -> Claude approval -> Codex implementation の mediated baton を通す
 - 作業開始時に Jira を `In Progress` / `進行中` / `作業中` へ best-effort transition する
 - PR merge 後だけ Jira を `Done` / `完了` へ best-effort transition する
-- `ready_for_merge` で停止し、merge は人か既存 GitHub ルールに委ねる
+- 既定では `ready_for_merge` 後に GitHub auto-merge / merge queue を有効化する。ローカル autopilot merge は標準経路ではない
 - public HTTPS URL が必要なのは webhook mode を明示した場合だけ
 
 macOS ローカルでログイン時に worker を自動再起動したい場合:
@@ -169,6 +170,7 @@ Codex GitHub review の有効化は ChatGPT/Codex settings 側の repo 単位ト
 ./bin/platform orchestrator pause --issue PROJ-123
 ./bin/platform orchestrator resume --issue PROJ-123
 ./bin/platform orchestrator cancel --issue PROJ-123
+./bin/platform orchestrator fail --issue PROJ-123 --backlog --reason "validation failed"
 ```
 
 `status` without `--refresh` reads the local SQLite state only. If the worker is not running, use `poll` or `status --refresh` to refresh GitHub checks/reviews and Jira reporting.
@@ -183,6 +185,21 @@ Jira 側でも次の comment commands を使えます。
   - `/ai pause-project`
   - `/ai resume-project`
   - `/ai drain-project`
+
+### 11. 複数 issue を batch で並列実行する
+```bash
+./bin/platform orchestrator batch create \
+  --project PROJ \
+  --jql 'project = PROJ AND labels = "ai:auto" AND status in ("To Do", "Selected for Development")' \
+  --max-parallel 3
+
+./bin/platform orchestrator batch status
+./bin/platform orchestrator batch pause --batch PROJ-YYYYMMDDHHMMSS
+./bin/platform orchestrator batch resume --batch PROJ-YYYYMMDDHHMMSS
+./bin/platform orchestrator batch cancel --batch PROJ-YYYYMMDDHHMMSS
+```
+
+Batch planning は Claude coordinator が DAG / dependency / conflict group / task contract を作り、Codex worker は issue 単位で実装します。各 Codex worker は実装前に `task_understanding` を返し、Claude が `approved` を返した場合だけ編集します。
 
 ## Recommended tool versions
 - OpenAI / Codex:

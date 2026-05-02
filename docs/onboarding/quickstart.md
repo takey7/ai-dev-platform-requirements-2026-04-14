@@ -120,7 +120,7 @@ Webhook mode is optional. Only use it when you intentionally want Jira Automatio
 ./bin/platform orchestrator run --poll-only
 ```
 
-The worker keeps a SQLite WAL state DB under `~/.local/state/ai-dev-platform/orchestrator/`, polls Jira issues/comments and GitHub checks/reviews, mirrors progress to Jira, moves active jobs to `In Progress` best-effort, and stops at `ready_for_merge`. Jira moves to `Done` only after the PR is merged.
+The worker keeps a SQLite WAL state DB under `~/.local/state/ai-dev-platform/orchestrator/`, polls Jira issues/comments and GitHub checks/reviews, mirrors progress to Jira, runs the Claude-Codex mediated baton before implementation, moves active jobs to `In Progress` best-effort, and enables GitHub auto-merge / merge queue when PRs reach `ready_for_merge`. Jira moves to `Done` only after the PR is merged.
 
 For always-on hosting, use the worker host layout in [orchestrator-host.md](orchestrator-host.md). A public URL is required only for optional webhook mode.
 
@@ -139,6 +139,17 @@ If the worker is not running and a job is waiting on GitHub, refresh state manua
 For a guided first run, use [first-project-walkthrough.md](first-project-walkthrough.md).
 
 For Codex GitHub review setup, use [codex-github-review.md](codex-github-review.md).
+For mediated baton and parallel batch operation, use [parallel-batch-orchestrator.md](parallel-batch-orchestrator.md).
+
+To run multiple independent Jira issues in parallel:
+```bash
+./bin/platform orchestrator batch create \
+  --project PROJ \
+  --jql 'project = PROJ AND labels = "ai:auto" AND status in ("To Do", "Selected for Development")' \
+  --max-parallel 3
+
+./bin/platform orchestrator batch status
+```
 
 ## 9. Start day-to-day flow
 ```bash

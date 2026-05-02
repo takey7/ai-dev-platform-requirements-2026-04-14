@@ -119,7 +119,23 @@ Use `--claude-model best --claude-effort xhigh` only for a dedicated worker wher
   "github": {
     "codex_review_authors": ["codex", "codex[bot]", "chatgpt-codex-connector"],
     "auto_review_grace_seconds": 180,
-    "fallback_review_grace_seconds": 300
+    "fallback_review_grace_seconds": 300,
+    "merge_policy": "merge_queue"
+  },
+  "scheduler": {
+    "max_parallel_per_repo": 3,
+    "max_parallel_per_project": 5,
+    "contract_handshake": "required",
+    "max_baton_rounds": 2
+  },
+  "timeouts": {
+    "claude_seconds": 600,
+    "codex_exec_seconds": 900,
+    "codex_review_seconds": 180
+  },
+  "failure": {
+    "max_attempts": 2,
+    "backlog_statuses": ["To Do", "Backlog"]
   },
   "ai": {
     "codex_model": "",
@@ -138,6 +154,8 @@ Use `--claude-model best --claude-effort xhigh` only for a dedicated worker wher
 - polling JQL and comment checks are scoped to each repo's Jira project key
 - duplicate Jira project keys across repos must fail registration
 - all sticky comments, jobs, worktrees, and temporary files stay namespaced by project key
+- within one repo, independent issues may run in parallel up to `scheduler.max_parallel_per_repo`
+- conflict group and dependency leases prevent concurrent edits to the same shared surface
 
 ## Registration flow
 For each consuming repo:
@@ -169,3 +187,5 @@ platform orchestrator register \
 6. confirm Codex review arrives as a real GitHub review or the worker marks the issue blocked after fallback timeout
 7. confirm Jira moves to `In Progress` / `進行中` / `作業中` after the job starts
 8. confirm Jira does not move to `Done` / `完了` at `ready_for_merge`; it moves only after the PR is merged
+9. confirm independent issues can run in parallel while shared conflict groups serialize
+10. confirm failed issues move back to `To Do` / `Backlog` and the scheduler continues with the next executable issue

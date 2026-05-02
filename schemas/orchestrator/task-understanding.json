@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "required": [
+    "summary",
+    "understood_scope",
+    "planned_files",
+    "ambiguities",
+    "risky_assumptions",
+    "validation_plan"
+  ],
+  "properties": {
+    "summary": { "type": "string", "minLength": 1 },
+    "understood_scope": { "type": "string" },
+    "planned_files": { "type": "array", "items": { "type": "string" } },
+    "ambiguities": { "type": "array", "items": { "type": "string" } },
+    "risky_assumptions": { "type": "array", "items": { "type": "string" } },
+    "validation_plan": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}
