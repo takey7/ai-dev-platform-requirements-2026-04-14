@@ -126,12 +126,18 @@ Use `--claude-model best --claude-effort xhigh` only for a dedicated worker wher
     "max_parallel_per_repo": 3,
     "max_parallel_per_project": 5,
     "contract_handshake": "required",
-    "max_baton_rounds": 2
+    "max_baton_rounds": 2,
+    "control_flag_ttl_seconds": 28800,
+    "lease_ttl_seconds": 1800,
+    "waiting_dependency_warn_seconds": 86400,
+    "project_backoff_seconds": 300
   },
   "timeouts": {
     "claude_seconds": 600,
     "codex_exec_seconds": 900,
-    "codex_review_seconds": 180
+    "codex_review_seconds": 180,
+    "github_checks_seconds": 2700,
+    "merge_queue_seconds": 7200
   },
   "failure": {
     "max_attempts": 2,
@@ -189,3 +195,45 @@ platform orchestrator register \
 8. confirm Jira does not move to `Done` / `完了` at `ready_for_merge`; it moves only after the PR is merged
 9. confirm independent issues can run in parallel while shared conflict groups serialize
 10. confirm failed issues move back to `To Do` / `Backlog` and the scheduler continues with the next executable issue
+
+## Health and stop-scope triage
+
+Use `health` before restarting the worker blindly:
+
+```bash
+platform orchestrator health
+platform orchestrator health --project PROJ
+platform doctor --target /srv/workspaces/<repo>
+```
+
+Read the states by scope:
+
+- `service_health.degraded`: Jira/GitHub/Claude/Codex/toolchain is temporarily unavailable. The queue is preserved and unrelated projects keep running.
+- `gate_waiting_human`: one issue is waiting for human approval, pending checks timeout, Codex review, or merge queue progress.
+- `gate_failed`: one issue failed a required validation/security/spec gate.
+- `waiting_dependency`: one issue is blocked by another issue, but does not consume a parallel slot.
+- `blocked`: tool, permission, or contract problem where automatic continuation would be unsafe.
+
+Default control flags expire:
+
+```bash
+platform orchestrator pause --project PROJ --ttl 8h
+platform orchestrator drain --project PROJ --ttl 8h
+platform orchestrator undrain --project PROJ
+platform orchestrator resume --project PROJ
+```
+
+Use `--no-expire` only for explicit maintenance windows. A permanent global pause should be treated as a high-severity operational condition and cleared with:
+
+```bash
+platform orchestrator resume --global
+```
+
+If a batch has dependency deadlock or conflict groups that are too broad:
+
+```bash
+platform orchestrator batch status --batch PROJ-YYYYMMDDHHMMSS
+platform orchestrator batch replan --batch PROJ-YYYYMMDDHHMMSS
+```
+
+`batch status` reports runnable, waiting, gate, blocked, done, and conflict-blocked counts so one intentionally stopped PR does not hide independent runnable work.

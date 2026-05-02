@@ -40,7 +40,7 @@ export PROJECTS_ROOT="$HOME/workspaces"
 
 export GITHUB_OWNER="takey7"
 export PLATFORM_SOURCE_REPO="takey7/ai-dev-platform-requirements-2026-04-14"
-export PLATFORM_VERSION="v0.2.1"
+export PLATFORM_VERSION="v0.2.2"
 
 export JIRA_SITE_URL="https://ssbot.atlassian.net"
 export JIRA_ADMIN_EMAIL="YOUR_ATLASSIAN_ADMIN_EMAIL@example.com"
@@ -326,12 +326,15 @@ cd "$PLATFORM_SOURCE"
 
 ./bin/platform orchestrator poll --issue "$ISSUE_KEY"
 ./bin/platform orchestrator status --issue "$ISSUE_KEY" --refresh
+./bin/platform orchestrator health --project "$JIRA_KEY"
 ```
 
 一時停止、再開、キャンセル:
 
 ```bash
 ./bin/platform orchestrator pause --issue "$ISSUE_KEY"
+./bin/platform orchestrator drain --project "$JIRA_KEY" --ttl 8h
+./bin/platform orchestrator undrain --project "$JIRA_KEY"
 ./bin/platform orchestrator resume --issue "$ISSUE_KEY"
 ./bin/platform orchestrator cancel --issue "$ISSUE_KEY"
 ./bin/platform orchestrator fail --issue "$ISSUE_KEY" --backlog --reason "manual failover"
@@ -345,6 +348,7 @@ Jira comment からも操作できます。
 /ai resume
 /ai retry
 /ai cancel
+/ai unblock
 ```
 
 ## 12. 手動で追加実装を指示する場合
@@ -404,6 +408,7 @@ cd "$PLATFORM_SOURCE"
   --max-parallel 3
 
 ./bin/platform orchestrator batch status
+./bin/platform orchestrator batch replan --batch "<batch_id>"
 ```
 
 Claude coordinator が dependency / conflict group / task contract を作ります。同じ conflict group や依存関係がある issue は同時に lease されず、独立 issue だけが並列で Codex worker に渡ります。
@@ -415,6 +420,8 @@ Claude coordinator が dependency / conflict group / task contract を作りま�
 ./bin/platform orchestrator gate unblock --issue "$JIRA_KEY-123" --reason "required check fixed"
 ./bin/platform orchestrator fail --issue "$JIRA_KEY-123" --backlog --reason "spec gate failed intentionally"
 ```
+
+`gate_*` は issue 単位の隔離、`service_health.degraded` は外部依存や toolchain の一時不調です。通常は global pause せず、独立 issue は継続させます。
 
 停止・再開:
 

@@ -24,7 +24,7 @@ if str(SCRIPT_PATH.parent) not in sys.path:
     sys.path.insert(0, str(SCRIPT_PATH.parent))
 import platform_orchestrator
 
-DEFAULT_PLATFORM_VERSION = "0.2.1"
+DEFAULT_PLATFORM_VERSION = "0.2.2"
 DEFAULT_SOURCE_REF = "main"
 DEFAULT_ATLASSIAN_MCP_URL = "https://mcp.atlassian.com/v1/mcp"
 DEFAULT_PROJECTS_ROOT = str((Path.home() / "workspaces").expanduser())
@@ -1018,6 +1018,7 @@ def inspect_target(target: Path) -> tuple[list[str], list[str]]:
     warnings.extend(check_codex_review_health(target, manifest))
     warnings.extend(check_codex_external_agent_sessions(target))
     warnings.extend(check_orchestrator_registration(target, manifest))
+    warnings.extend(check_github_ruleset_health(target, manifest))
 
     if adapter == "node-ts":
         package_json_path = target / "package.json"
@@ -1786,6 +1787,11 @@ def check_workflow_gate_triggers(target: Path) -> list[str]:
                 f"{rel_path} may not expose the required check name `{check_name}`. "
                 "Confirm branch protection required checks match workflow job names."
             )
+        if "concurrency:" in text and "cancel-in-progress: true" in text.lower():
+            warnings.append(
+                f"{rel_path} uses `concurrency.cancel-in-progress: true`. "
+                "That can cancel older required checks and stall merge queue/pending checks for unrelated PRs."
+            )
     return warnings
 
 
@@ -2105,6 +2111,61 @@ def request_codex_review_comment(*, target: Path, pr_number: int, force: bool) -
     print(f"Requested Codex review on PR #{pr_number}.")
 
 
+def check_github_ruleset_health(target: Path, manifest: dict[str, Any]) -> list[str]:
+    repo = infer_repo_full_name(target)
+    if not repo:
+        return []
+    result = run_optional(["gh", "api", f"repos/{repo}/rulesets"], cwd=target)
+    if not result or result.returncode != 0 or not result.stdout.strip():
+        return []
+    try:
+        rulesets = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    expected_checks = set(manifest.get("checks", {}).get("enabled", REQUIRED_CHECKS))
+    warnings: list[str] = []
+    for ruleset in rulesets if isinstance(rulesets, list) else []:
+        name = str(ruleset.get("name", "ruleset"))
+        rules = ruleset.get("rules", [])
+        required_checks: set[str] = set()
+        merge_queue = False
+        required_reviews = False
+        for rule in rules if isinstance(rules, list) else []:
+            rule_type = str(rule.get("type", ""))
+            params = rule.get("parameters", {}) if isinstance(rule.get("parameters"), dict) else {}
+            if rule_type == "required_status_checks":
+                checks = params.get("required_status_checks") or params.get("required_status_checks_configurations") or []
+                for check in checks if isinstance(checks, list) else []:
+                    if isinstance(check, dict):
+                        name_value = check.get("context") or check.get("name") or check.get("check_name")
+                        if name_value:
+                            required_checks.add(str(name_value))
+            elif rule_type == "pull_request":
+                if int(params.get("required_approving_review_count") or 0) > 0:
+                    required_reviews = True
+                if params.get("require_code_owner_review"):
+                    required_reviews = True
+            elif rule_type == "merge_queue":
+                merge_queue = True
+        missing = sorted(expected_checks - required_checks) if required_checks else []
+        if missing:
+            warnings.append(
+                f"GitHub ruleset `{name}` required checks do not include expected platform checks: {', '.join(missing)}."
+            )
+        if merge_queue:
+            workflow_warnings = check_workflow_gate_triggers(target)
+            if any("merge_group" in warning for warning in workflow_warnings):
+                warnings.append(
+                    f"GitHub ruleset `{name}` enables merge queue, but one or more required workflows lack `merge_group` triggers."
+                )
+        if required_reviews:
+            warnings.append(
+                f"GitHub ruleset `{name}` requires human/code-owner review. "
+                "This is supported, but orchestrator will quarantine PRs at `gate_waiting_human` until review completes."
+            )
+    return warnings
+
+
 def check_orchestrator_registration(target: Path, manifest: dict[str, Any]) -> list[str]:
     warnings: list[str] = []
     project_key = manifest_issue_project_key(manifest)
@@ -2151,6 +2212,30 @@ def check_orchestrator_registration(target: Path, manifest: dict[str, Any]) -> l
         warnings.append(
             "Orchestrator Automation rule IDs are missing. Confirm Jira Automation rules were created or import the exported blueprints."
         )
+    for flag in store.list_control_flags():
+        if flag.get("scope_type") == "global" and flag.get("flag") == "pause" and flag.get("value") == "paused":
+            expires_at = str(flag.get("expires_at", ""))
+            if expires_at:
+                warnings.append(f"Orchestrator has a global pause until {expires_at}.")
+            else:
+                warnings.append("Orchestrator has a permanent global pause. Use `platform orchestrator resume --global`.")
+        if (
+            flag.get("scope_type") == "project"
+            and flag.get("scope_key") == project_key
+            and flag.get("flag") in {"pause", "drain"}
+            and flag.get("value") in {"paused", "enabled"}
+        ):
+            warnings.append(
+                f"Orchestrator project `{project_key}` has `{flag.get('flag')}` set to `{flag.get('value')}`"
+                + (f" until {flag.get('expires_at')}" if flag.get("expires_at") else " permanently")
+                + "."
+            )
+    for health in store.list_service_health(project_key=project_key):
+        if health.get("status") != "healthy":
+            warnings.append(
+                f"Orchestrator service health degraded for {health.get('scope_type')}:{health.get('scope_key')} "
+                f"{health.get('component')}: {health.get('message')}"
+            )
     return warnings
 
 

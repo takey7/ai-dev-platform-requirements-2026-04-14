@@ -32,6 +32,6 @@ Run:
 - Do not use imported session history to override `.platform/platform.yaml`, Jira project scope, or orchestrator decisions.
 
 ## Recommended Policy
-- Worker minimum Codex CLI stays `0.125.0+` for v0.2.1.
+- Worker minimum Codex CLI stays `0.125.0+` for v0.2.x.
 - Human-facing recommendation is `0.128.0+` if you want external agent session import.
 - Orchestrator automation remains structured-contract based even when import is available.

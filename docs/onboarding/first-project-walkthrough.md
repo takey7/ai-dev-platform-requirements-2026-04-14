@@ -56,7 +56,7 @@ pnpm --version
   --github-owner <GITHUB_OWNER> \
   --projects-root ~/workspaces \
   --source-repo <GITHUB_OWNER>/ai-dev-platform-requirements-2026-04-14 \
-  --source-ref v0.2.1 \
+  --source-ref v0.2.2 \
   --adapter node-ts \
   --launch-mode none \
   --jira-site-url https://<SITE>.atlassian.net \

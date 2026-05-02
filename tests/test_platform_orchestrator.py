@@ -1761,6 +1761,326 @@ class PlatformOrchestratorTests(unittest.TestCase):
     def test_parse_control_command_accepts_unblock(self) -> None:
         self.assertEqual(orchestrator.parse_control_command("/ai unblock"), "unblock")
 
+    def test_parse_duration_seconds_supports_ttl_units(self) -> None:
+        self.assertEqual(orchestrator.parse_duration_seconds("30s", 1), 30)
+        self.assertEqual(orchestrator.parse_duration_seconds("15m", 1), 900)
+        self.assertEqual(orchestrator.parse_duration_seconds("2h", 1), 7200)
+        self.assertEqual(orchestrator.parse_duration_seconds("1d", 1), 86400)
+        self.assertEqual(orchestrator.parse_duration_seconds("bad", 42), 42)
+
+    def test_control_flag_ttl_expires_and_undrain_is_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.set_control_flag(
+                "project",
+                "BILL",
+                "pause",
+                "paused",
+                reason="test",
+                created_by="unit",
+                expires_at=orchestrator.iso_after_seconds(-1),
+            )
+            self.assertEqual(store.control_flag_value("project", "BILL", "pause"), "")
+            store.set_control_flag("project", "BILL", "drain", "enabled")
+            self.assertEqual(store.control_flag_value("project", "BILL", "drain"), "enabled")
+            store.set_control_flag("project", "BILL", "drain", "disabled")
+            self.assertEqual(store.control_flag_value("project", "BILL", "drain"), "disabled")
+            self.assertEqual(orchestrator.parse_control_command("/ai undrain-project"), "undrain-project")
+
+    def test_service_health_records_project_backoff_without_failing_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.record_service_health(
+                "project",
+                "BILL",
+                "jira",
+                "degraded",
+                "temporary DNS failure",
+                backoff_seconds=60,
+            )
+
+            self.assertTrue(store.service_backoff_active("project", "BILL", "jira"))
+            health = store.list_service_health(project_key="BILL")
+            self.assertEqual(health[0]["status"], "degraded")
+            self.assertIn("DNS", health[0]["message"])
+
+    def test_reconcile_project_failure_does_not_stop_other_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_a = Path(tmpdir) / "repo-a"
+            repo_b = Path(tmpdir) / "repo-b"
+            repo_a.mkdir()
+            repo_b.mkdir()
+            projects = [
+                orchestrator.RepoProject(
+                    project_key="BILL",
+                    repo_path=repo_a,
+                    repo_name="repo-a",
+                    confluence_space="ENG",
+                    codex_review_mode="auto_required",
+                    transition_policy=orchestrator.default_transition_policy(),
+                    manifest_path=repo_a / ".platform" / "platform.yaml",
+                    source_repo="takey7/platform",
+                    workflow_ref="v0.1.5",
+                ),
+                orchestrator.RepoProject(
+                    project_key="SHOP",
+                    repo_path=repo_b,
+                    repo_name="repo-b",
+                    confluence_space="ENG",
+                    codex_review_mode="auto_required",
+                    transition_policy=orchestrator.default_transition_policy(),
+                    manifest_path=repo_b / ".platform" / "platform.yaml",
+                    source_repo="takey7/platform",
+                    workflow_ref="v0.1.5",
+                ),
+            ]
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.sync_projects(projects)
+            settings = SimpleNamespace(projects_roots=(Path(tmpdir),), project_backoff_seconds=60)
+            service = orchestrator.OrchestratorService(settings=settings, store=store)
+            original_discover = orchestrator.discover_projects
+            original_search = orchestrator.jira_search_auto_issues
+            try:
+                orchestrator.discover_projects = lambda _roots: projects
+                orchestrator.jira_search_auto_issues = lambda _settings, key: (
+                    (_ for _ in ()).throw(orchestrator.OrchestratorError("jira dns failure"))
+                    if key == "BILL"
+                    else [{"key": "SHOP-1"}]
+                )
+                service.poll_jira_control_comments = lambda *_args, **_kwargs: 0
+                service.maybe_enqueue_issue = lambda _project, _issue: True
+
+                count = service.reconcile_projects()
+            finally:
+                orchestrator.discover_projects = original_discover
+                orchestrator.jira_search_auto_issues = original_search
+
+            self.assertEqual(count, 1)
+            self.assertTrue(store.service_backoff_active("project", "BILL", "jira"))
+            self.assertEqual(store.service_health("project", "SHOP", "jira")["status"], "healthy")
+
+    def test_stale_scheduler_lease_reaper_requeues_processing_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = str(Path(tmpdir) / "repo")
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.enqueue_issue(project_key="BILL", repo_path=repo, issue_key="BILL-1", status="To Do", summary="stale")
+            store.update_job("BILL-1", state="coding", active_pid=123)
+            self.assertTrue(
+                store.acquire_lease(
+                    repo,
+                    "BILL-1",
+                    project_key="BILL",
+                    conflict_group="api",
+                    max_parallel_per_repo=1,
+                    max_parallel_per_project=1,
+                    lease_ttl_seconds=-1,
+                )
+            )
+
+            stale = store.reap_stale_scheduler_leases()
+
+            self.assertEqual(len(stale), 1)
+            job = store.get_job("BILL-1")
+            self.assertEqual(job["state"], "queued")
+            self.assertIsNone(job["active_pid"])
+            self.assertTrue(
+                store.acquire_lease(
+                    repo,
+                    "BILL-2",
+                    project_key="BILL",
+                    conflict_group="api",
+                    max_parallel_per_repo=1,
+                    max_parallel_per_project=1,
+                )
+            )
+
+    def test_pending_checks_timeout_quarantines_only_that_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.enqueue_issue(project_key="BILL", repo_path=str(repo), issue_key="BILL-1", status="To Do", summary="pending")
+            store.update_job(
+                "BILL-1",
+                state="waiting_checks",
+                branch="codex/BILL-1",
+                worktree_path=str(repo),
+                pr_number="1",
+                state_entered_at="2000-01-01T00:00:00+00:00",
+            )
+            settings = SimpleNamespace(
+                codex_review_authors=("codex",),
+                pending_check_timeout_seconds=1,
+                auto_review_grace_seconds=999,
+                fallback_review_grace_seconds=999,
+                github_merge_policy="manual",
+            )
+            service = orchestrator.OrchestratorService(settings=settings, store=store)
+            original_status = orchestrator.github_pull_request_status
+            original_upsert = orchestrator.upsert_summary_comment
+            try:
+                orchestrator.github_pull_request_status = lambda *_args, **_kwargs: {
+                    "number": 1,
+                    "url": "https://github.example/pull/1",
+                    "state": "OPEN",
+                    "headRefOid": "abc",
+                    "reviews": [],
+                    "comments": [],
+                    "statusCheckRollup": [],
+                }
+                orchestrator.upsert_summary_comment = lambda *_args, **_kwargs: "comment-1"
+                service.poll_github_jobs(issue_key="BILL-1")
+            finally:
+                orchestrator.github_pull_request_status = original_status
+                orchestrator.upsert_summary_comment = original_upsert
+
+            job = store.get_job("BILL-1")
+            self.assertEqual(job["state"], "gate_waiting_human")
+            self.assertEqual(job["gate_state"], "pending_checks_timeout")
+
+    def test_merge_queue_stuck_quarantines_ready_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.enqueue_issue(project_key="BILL", repo_path=str(repo), issue_key="BILL-1", status="In Progress", summary="queue")
+            store.update_job(
+                "BILL-1",
+                state="ready_for_merge",
+                branch="codex/BILL-1",
+                worktree_path=str(repo),
+                pr_number="1",
+                state_entered_at="2000-01-01T00:00:00+00:00",
+            )
+            settings = SimpleNamespace(
+                codex_review_authors=("codex",),
+                merge_queue_stuck_seconds=1,
+                github_merge_policy="merge_queue",
+                auto_review_grace_seconds=999,
+                fallback_review_grace_seconds=999,
+            )
+            service = orchestrator.OrchestratorService(settings=settings, store=store)
+            original_status = orchestrator.github_pull_request_status
+            original_upsert = orchestrator.upsert_summary_comment
+            original_auto_merge = orchestrator.ensure_github_auto_merge
+            try:
+                orchestrator.github_pull_request_status = lambda *_args, **_kwargs: {
+                    "number": 1,
+                    "url": "https://github.example/pull/1",
+                    "state": "OPEN",
+                    "headRefOid": "abc",
+                    "reviews": [{"state": "COMMENTED", "author": {"login": "codex"}}],
+                    "comments": [],
+                    "statusCheckRollup": [{"conclusion": "SUCCESS"}],
+                }
+                orchestrator.upsert_summary_comment = lambda *_args, **_kwargs: "comment-1"
+                orchestrator.ensure_github_auto_merge = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError())
+                service.poll_github_jobs(issue_key="BILL-1")
+            finally:
+                orchestrator.github_pull_request_status = original_status
+                orchestrator.upsert_summary_comment = original_upsert
+                orchestrator.ensure_github_auto_merge = original_auto_merge
+
+            job = store.get_job("BILL-1")
+            self.assertEqual(job["state"], "gate_waiting_human")
+            self.assertEqual(job["gate_state"], "merge_queue_stuck")
+
+    def test_batch_dependency_cycle_marks_only_cycle_issues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.sync_projects([
+                orchestrator.RepoProject(
+                    project_key="BILL",
+                    repo_path=repo,
+                    repo_name="repo",
+                    confluence_space="ENG",
+                    codex_review_mode="auto_required",
+                    transition_policy=orchestrator.default_transition_policy(),
+                    manifest_path=repo / ".platform" / "platform.yaml",
+                    source_repo="takey7/platform",
+                    workflow_ref="v0.1.5",
+                )
+            ])
+            original_search = orchestrator.jira_search_jql
+            original_plan = orchestrator.run_claude_batch_plan
+            try:
+                orchestrator.jira_search_jql = lambda _settings, _jql: [
+                    {"key": "BILL-1", "fields": {"summary": "A", "status": {"name": "To Do"}}},
+                    {"key": "BILL-2", "fields": {"summary": "B", "status": {"name": "To Do"}}},
+                    {"key": "BILL-3", "fields": {"summary": "C", "status": {"name": "To Do"}}},
+                ]
+                orchestrator.run_claude_batch_plan = lambda **_kwargs: {
+                    "summary": "cycle",
+                    "design_memo": "",
+                    "work_units": [
+                        {"issue_key": "BILL-1", "dependencies": ["BILL-2"], "conflict_group": "a"},
+                        {"issue_key": "BILL-2", "dependencies": ["BILL-1"], "conflict_group": "b"},
+                        {"issue_key": "BILL-3", "dependencies": [], "conflict_group": "c"},
+                    ],
+                }
+                batch = orchestrator.create_batch_from_jql(
+                    store=store,
+                    settings=SimpleNamespace(),
+                    project_key="BILL",
+                    jql="project = BILL",
+                    max_parallel=3,
+                )
+            finally:
+                orchestrator.jira_search_jql = original_search
+                orchestrator.run_claude_batch_plan = original_plan
+
+            self.assertEqual(set(batch["cycle_issues"]), {"BILL-1", "BILL-2"})
+            self.assertEqual(store.get_job("BILL-1")["state"], "gate_failed")
+            self.assertEqual(store.get_job("BILL-2")["state"], "gate_failed")
+            self.assertEqual(store.get_job("BILL-3")["state"], "queued")
+
+    def test_batch_replan_can_release_waiting_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.sync_projects([
+                orchestrator.RepoProject(
+                    project_key="BILL",
+                    repo_path=repo,
+                    repo_name="repo",
+                    confluence_space="ENG",
+                    codex_review_mode="auto_required",
+                    transition_policy=orchestrator.default_transition_policy(),
+                    manifest_path=repo / ".platform" / "platform.yaml",
+                    source_repo="takey7/platform",
+                    workflow_ref="v0.1.5",
+                )
+            ])
+            store.create_batch(batch_id="batch-1", project_key="BILL", jql="project = BILL", max_parallel=3, summary="", design_memo="")
+            store.enqueue_issue(project_key="BILL", repo_path=str(repo), issue_key="BILL-1", status="To Do", summary="dep")
+            store.enqueue_issue(project_key="BILL", repo_path=str(repo), issue_key="BILL-2", status="To Do", summary="child")
+            store.update_job("BILL-1", state="gate_failed", batch_id="batch-1")
+            store.update_job(
+                "BILL-2",
+                state="waiting_dependency",
+                batch_id="batch-1",
+                dependencies_json=json.dumps(["BILL-1"]),
+            )
+            original_plan = orchestrator.run_claude_batch_plan
+            try:
+                orchestrator.run_claude_batch_plan = lambda **_kwargs: {
+                    "summary": "replanned",
+                    "design_memo": "independent now",
+                    "work_units": [
+                        {"issue_key": "BILL-2", "dependencies": [], "conflict_group": "child"},
+                    ],
+                }
+                result = orchestrator.replan_batch(store=store, settings=SimpleNamespace(), batch_id="batch-1")
+            finally:
+                orchestrator.run_claude_batch_plan = original_plan
+
+            self.assertEqual(result["replanned_issue_count"], 2)
+            self.assertEqual(store.get_job("BILL-2")["state"], "queued")
+            self.assertEqual(json.loads(store.get_job("BILL-2")["dependencies_json"]), [])
+
     def _git(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["git", *args],

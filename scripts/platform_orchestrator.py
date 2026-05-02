@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -57,6 +57,12 @@ DEFAULT_MAX_BATON_ROUNDS = 2
 DEFAULT_FAILURE_MAX_ATTEMPTS = 2
 DEFAULT_FAILURE_BACKLOG_STATUSES = ("To Do", "Backlog")
 DEFAULT_GITHUB_MERGE_POLICY = "merge_queue"
+DEFAULT_CONTROL_FLAG_TTL_SECONDS = 8 * 60 * 60
+DEFAULT_LEASE_TTL_SECONDS = 30 * 60
+DEFAULT_PENDING_CHECK_TIMEOUT_SECONDS = 45 * 60
+DEFAULT_MERGE_QUEUE_STUCK_SECONDS = 2 * 60 * 60
+DEFAULT_WAITING_DEPENDENCY_WARN_SECONDS = 24 * 60 * 60
+DEFAULT_PROJECT_BACKOFF_SECONDS = 5 * 60
 DEFAULT_TRANSITION_POLICY_MODE = "kanban_minimal"
 DEFAULT_ACTIVE_STATUS_ALIASES = ("In Progress", "進行中", "作業中")
 DEFAULT_DONE_STATUS_ALIASES = ("Done", "完了")
@@ -76,7 +82,7 @@ CONTROL_LABEL = "ai:control"
 WORKTREE_ROOTNAME = "worktrees"
 ISSUE_RE = re.compile(r"[A-Z][A-Z0-9]+-\d+")
 CONTROL_COMMAND_RE = re.compile(
-    r"^/ai\s+(pause|resume|cancel|retry|status|unblock|pause-project|resume-project|drain-project)\s*$",
+    r"^/ai\s+(pause|resume|cancel|retry|status|unblock|pause-project|resume-project|drain-project|undrain-project)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 EVENT_PATH_RE = re.compile(r"^/jira/events/(?P<project_key>[A-Za-z][A-Za-z0-9]+)$")
@@ -121,7 +127,7 @@ CODEX_CLI_INCOMPATIBLE_PATTERNS = (
 )
 TRANSIENT_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 DEFAULT_API_RETRY_ATTEMPTS = 3
-PLATFORM_RELEASE_VERSION = "v0.2.1"
+PLATFORM_RELEASE_VERSION = "v0.2.2"
 
 
 class OrchestratorError(RuntimeError):
@@ -168,6 +174,12 @@ class WorkerSettings:
     failure_max_attempts: int
     failure_backlog_statuses: tuple[str, ...]
     github_merge_policy: str
+    control_flag_ttl_seconds: int
+    lease_ttl_seconds: int
+    pending_check_timeout_seconds: int
+    merge_queue_stuck_seconds: int
+    waiting_dependency_warn_seconds: int
+    project_backoff_seconds: int
     claude_timeout_seconds: int
     codex_exec_timeout_seconds: int
     codex_review_timeout_seconds: int
@@ -410,6 +422,14 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     )
     status.set_defaults(func=cmd_status)
 
+    health = orchestrator_subparsers.add_parser(
+        "health",
+        help="Show worker/service health, stale leases, and stale jobs.",
+    )
+    health.add_argument("--config", default=None, help="Override the worker config path.")
+    health.add_argument("--project", default=None, help="Filter service health by Jira project key.")
+    health.set_defaults(func=cmd_health)
+
     pause = orchestrator_subparsers.add_parser(
         "pause", help="Pause one issue, one project, or the entire worker."
     )
@@ -417,6 +437,9 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     pause.add_argument("--issue", default=None, help="Pause a single issue.")
     pause.add_argument("--project", default=None, help="Pause all issues in a Jira project.")
     pause.add_argument("--global", dest="global_pause", action="store_true", help="Pause the whole worker.")
+    pause.add_argument("--ttl", default="8h", help="TTL for project/global pauses. Default: 8h.")
+    pause.add_argument("--no-expire", action="store_true", help="Make a project/global pause permanent.")
+    pause.add_argument("--reason", default="operator pause", help="Reason stored with the pause flag.")
     pause.set_defaults(func=cmd_pause)
 
     resume = orchestrator_subparsers.add_parser(
@@ -427,6 +450,18 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     resume.add_argument("--project", default=None, help="Resume all issues in a Jira project.")
     resume.add_argument("--global", dest="global_resume", action="store_true", help="Resume the whole worker.")
     resume.set_defaults(func=cmd_resume)
+
+    for name, help_text, value in (
+        ("drain", "Stop dispatching new work for a Jira project while allowing existing jobs to finish.", "enabled"),
+        ("undrain", "Allow dispatching new work for a drained Jira project.", "disabled"),
+    ):
+        parser = orchestrator_subparsers.add_parser(name, help=help_text)
+        parser.add_argument("--config", default=None, help="Override the worker config path.")
+        parser.add_argument("--project", required=True, help="Jira project key.")
+        parser.add_argument("--ttl", default="8h", help="TTL for drain flags. Default: 8h.")
+        parser.add_argument("--no-expire", action="store_true", help="Make the drain permanent.")
+        parser.add_argument("--reason", default=f"operator {name}", help="Reason stored with the drain flag.")
+        parser.set_defaults(func=cmd_drain_control, drain_value=value)
 
     cancel = orchestrator_subparsers.add_parser(
         "cancel", help="Cancel a single in-flight issue and keep its branch/PR/worktree."
@@ -485,6 +520,10 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     batch_status.add_argument("--config", default=None, help="Override the worker config path.")
     batch_status.add_argument("--batch", default=None, help="Batch id.")
     batch_status.set_defaults(func=cmd_batch_status)
+    batch_replan = batch_subparsers.add_parser("replan", help="Recompute dependency/conflict groups for a degraded batch.")
+    batch_replan.add_argument("--config", default=None, help="Override the worker config path.")
+    batch_replan.add_argument("--batch", required=True, help="Batch id.")
+    batch_replan.set_defaults(func=cmd_batch_replan)
     for name, help_text in (
         ("pause", "Pause a batch."),
         ("resume", "Resume a batch."),
@@ -787,6 +826,25 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_health(args: argparse.Namespace) -> int:
+    settings = load_worker_settings(config_override=args.config)
+    store = OrchestratorStore(settings.db_path)
+    store.reap_expired_control_flags()
+    stale_leases = store.list_stale_scheduler_leases()
+    payload = {
+        "worker": store.latest_worker_event("heartbeat"),
+        "toolchain": store.latest_worker_event("toolchain"),
+        "service_health": store.list_service_health(
+            project_key=args.project.upper() if args.project else None
+        ),
+        "stale_leases": stale_leases,
+        "stale_jobs": stale_jobs(store),
+        "control_flags": store.list_control_flags(),
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_pause(args: argparse.Namespace) -> int:
     return update_pause_state(
         config_override=args.config,
@@ -795,6 +853,8 @@ def cmd_pause(args: argparse.Namespace) -> int:
         global_scope=args.global_pause,
         value="paused",
         label="Pause",
+        ttl_seconds=None if args.no_expire else parse_duration_seconds(args.ttl, DEFAULT_CONTROL_FLAG_TTL_SECONDS),
+        reason=args.reason,
     )
 
 
@@ -806,7 +866,29 @@ def cmd_resume(args: argparse.Namespace) -> int:
         global_scope=args.global_resume,
         value="running",
         label="Resume",
+        ttl_seconds=None,
+        reason="operator resume",
     )
+
+
+def cmd_drain_control(args: argparse.Namespace) -> int:
+    settings = load_worker_settings(config_override=args.config)
+    store = OrchestratorStore(settings.db_path)
+    project_key = args.project.upper()
+    ttl_seconds = None if args.no_expire else parse_duration_seconds(args.ttl, DEFAULT_CONTROL_FLAG_TTL_SECONDS)
+    expires_at = iso_after_seconds(ttl_seconds) if args.drain_value == "enabled" else ""
+    store.set_control_flag(
+        "project",
+        project_key,
+        "drain",
+        args.drain_value,
+        reason=args.reason,
+        created_by="operator",
+        expires_at=expires_at,
+    )
+    action = "Drain" if args.drain_value == "enabled" else "Undrain"
+    print(f"{action} applied to project:{project_key}")
+    return 0
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
@@ -899,6 +981,15 @@ def cmd_batch_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_batch_replan(args: argparse.Namespace) -> int:
+    settings = load_worker_settings(config_override=args.config)
+    require_runtime_credentials(settings)
+    store = OrchestratorStore(settings.db_path)
+    result = replan_batch(store=store, settings=settings, batch_id=args.batch)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_batch_control(args: argparse.Namespace) -> int:
     settings = load_worker_settings(config_override=args.config)
     store = OrchestratorStore(settings.db_path)
@@ -974,6 +1065,8 @@ def update_pause_state(
     global_scope: bool,
     value: str,
     label: str,
+    ttl_seconds: int | None,
+    reason: str,
 ) -> int:
     if sum(bool(item) for item in (issue_key, project_key, global_scope)) != 1:
         raise SystemExit("Exactly one of --issue, --project, or --global is required.")
@@ -995,7 +1088,15 @@ def update_pause_state(
         return 0
     scope_type = "global" if global_scope else "project"
     scope_key = "*" if global_scope else project_key or ""
-    store.set_control_flag(scope_type, scope_key, "pause", value)
+    store.set_control_flag(
+        scope_type,
+        scope_key,
+        "pause",
+        value,
+        reason=reason,
+        created_by="operator",
+        expires_at=iso_after_seconds(ttl_seconds) if value == "paused" else "",
+    )
     print(f"{label} applied to {scope_type}:{scope_key}")
     return 0
 
@@ -1170,6 +1271,33 @@ def dependency_status(store: "OrchestratorStore", job: dict[str, Any]) -> dict[s
     }
 
 
+def state_age_seconds(job: dict[str, Any]) -> int:
+    return seconds_since(str(job.get("state_entered_at") or job.get("updated_at") or ""))
+
+
+def batch_schedule_summary(jobs: list[dict[str, Any]]) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    conflict_groups: dict[str, int] = {}
+    for job in jobs:
+        state = str(job.get("state", "unknown") or "unknown")
+        counts[state] = counts.get(state, 0) + 1
+        if state in {"queued", "waiting_dependency"}:
+            group = str(job.get("conflict_group") or job.get("issue_key") or "")
+            if group:
+                conflict_groups[group] = conflict_groups.get(group, 0) + 1
+    return {
+        "runnable": counts.get("queued", 0),
+        "waiting_dependency": counts.get("waiting_dependency", 0),
+        "gate": sum(counts.get(state, 0) for state in GATE_STATES),
+        "blocked": sum(counts.get(state, 0) for state in {"blocked", "failed", "backlog"}),
+        "done": counts.get("done", 0),
+        "conflict_blocked_groups": {
+            group: count for group, count in conflict_groups.items() if count > 1
+        },
+        "states": counts,
+    }
+
+
 def batch_effective_state(batch: dict[str, Any], jobs: list[dict[str, Any]]) -> str:
     explicit = str(batch.get("state", ""))
     if explicit in {"paused", "cancelled"}:
@@ -1325,6 +1453,23 @@ def status_hints(
     return hints
 
 
+def stale_jobs(store: "OrchestratorStore", *, threshold_seconds: int = DEFAULT_LEASE_TTL_SECONDS * 2) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for job in store.list_jobs():
+        state = str(job.get("state", ""))
+        if state in {"planning", "coding", "reviewing", "pr_open"} and state_age_seconds(job) >= threshold_seconds:
+            result.append(
+                {
+                    "issue_key": job.get("issue_key", ""),
+                    "project_key": job.get("project_key", ""),
+                    "state": state,
+                    "state_age_seconds": state_age_seconds(job),
+                    "active_pid": job.get("active_pid"),
+                }
+            )
+    return result
+
+
 class OrchestratorService:
     def __init__(self, *, settings: WorkerSettings, store: "OrchestratorStore") -> None:
         self.settings = settings
@@ -1336,21 +1481,29 @@ class OrchestratorService:
         self.next_github_poll_at = 0.0
 
     def run(self, *, once: bool, enable_http: bool) -> None:
-        self.sync_projects()
+        self.safe_worker_step("sync_projects", self.sync_projects)
         self.store.clear_all_leases()
         self.store.recover_inflight_jobs()
         server = self.start_http_server() if enable_http else None
         try:
             while not self.stop_event.is_set():
-                self.sync_projects()
+                self.store.record_worker_event(
+                    "heartbeat",
+                    {
+                        "source_repo": str(REPO_ROOT),
+                        "version": PLATFORM_RELEASE_VERSION,
+                        "pid": os.getpid(),
+                    },
+                )
+                self.safe_worker_step("sync_projects", self.sync_projects)
                 now = time.monotonic()
                 if now >= self.next_reconcile_at:
-                    self.reconcile_projects()
+                    self.safe_worker_step("reconcile_projects", self.reconcile_projects)
                     self.next_reconcile_at = now + self.settings.poll_intervals["reconcile_seconds"]
                 if now >= self.next_github_poll_at:
-                    self.poll_github_jobs()
+                    self.safe_worker_step("poll_github_jobs", self.poll_github_jobs)
                     self.next_github_poll_at = now + self.settings.poll_intervals["github_seconds"]
-                self.dispatch_jobs()
+                self.safe_worker_step("dispatch_jobs", self.dispatch_jobs)
                 self.collect_finished_threads()
                 if once:
                     return
@@ -1359,6 +1512,23 @@ class OrchestratorService:
             if server:
                 server.shutdown()
                 server.server_close()
+
+    def safe_worker_step(self, component: str, callback: Any) -> Any:
+        try:
+            result = callback()
+            self.store.record_service_health("global", "*", component, "healthy")
+            return result
+        except Exception as exc:  # pragma: no cover - defensive service guard
+            self.store.record_service_health(
+                "global",
+                "*",
+                component,
+                "degraded",
+                str(exc),
+                details={"exception_type": type(exc).__name__},
+                backoff_seconds=self.settings.project_backoff_seconds,
+            )
+            return None
 
     def start_http_server(self) -> ThreadingHTTPServer:
         host, port = self.settings.bind_host, self.settings.bind_port
@@ -1448,11 +1618,43 @@ class OrchestratorService:
         control_issue_key = self.store.project_control_issue(project_key)
         if issue_key == control_issue_key:
             if command == "pause-project":
-                self.store.set_control_flag("project", project_key, "pause", "paused")
+                self.store.set_control_flag(
+                    "project",
+                    project_key,
+                    "pause",
+                    "paused",
+                    reason="Jira /ai pause-project",
+                    created_by="jira-comment",
+                    expires_at=iso_after_seconds(getattr(self.settings, "control_flag_ttl_seconds", DEFAULT_CONTROL_FLAG_TTL_SECONDS)),
+                )
             elif command == "resume-project":
-                self.store.set_control_flag("project", project_key, "pause", "running")
+                self.store.set_control_flag(
+                    "project",
+                    project_key,
+                    "pause",
+                    "running",
+                    reason="Jira /ai resume-project",
+                    created_by="jira-comment",
+                )
             elif command == "drain-project":
-                self.store.set_control_flag("project", project_key, "drain", "enabled")
+                self.store.set_control_flag(
+                    "project",
+                    project_key,
+                    "drain",
+                    "enabled",
+                    reason="Jira /ai drain-project",
+                    created_by="jira-comment",
+                    expires_at=iso_after_seconds(getattr(self.settings, "control_flag_ttl_seconds", DEFAULT_CONTROL_FLAG_TTL_SECONDS)),
+                )
+            elif command == "undrain-project":
+                self.store.set_control_flag(
+                    "project",
+                    project_key,
+                    "drain",
+                    "disabled",
+                    reason="Jira /ai undrain-project",
+                    created_by="jira-comment",
+                )
             return
         if command == "pause":
             self.store.set_requested_action(issue_key, "pause")
@@ -1477,6 +1679,7 @@ class OrchestratorService:
             self.refresh_issue_report(issue_key)
 
     def reconcile_projects(self, project_key: str | None = None) -> int:
+        self.store.reap_expired_control_flags()
         if self.store.control_flag_value("global", "*", "pause") == "paused":
             return 0
         count = 0
@@ -1484,13 +1687,29 @@ class OrchestratorService:
         for current_key, project in projects.items():
             if project_key and current_key != project_key:
                 continue
-            count += self.poll_jira_control_comments(current_key)
-            if self.store.control_flag_value("project", current_key, "pause") == "paused":
+            if self.store.service_backoff_active("project", current_key, "jira"):
                 continue
-            for issue in jira_search_auto_issues(self.settings, current_key):
-                count += self.poll_jira_control_comments(current_key, issue_keys=[str(issue["key"])])
-                if self.maybe_enqueue_issue(current_key, issue["key"]):
-                    count += 1
+            try:
+                count += self.poll_jira_control_comments(current_key)
+                if self.store.control_flag_value("project", current_key, "pause") == "paused":
+                    self.store.record_service_health("project", current_key, "jira", "healthy")
+                    continue
+                for issue in jira_search_auto_issues(self.settings, current_key):
+                    count += self.poll_jira_control_comments(current_key, issue_keys=[str(issue["key"])])
+                    if self.maybe_enqueue_issue(current_key, issue["key"]):
+                        count += 1
+                self.store.record_service_health("project", current_key, "jira", "healthy")
+            except Exception as exc:
+                self.store.record_service_health(
+                    "project",
+                    current_key,
+                    "jira",
+                    "degraded",
+                    str(exc),
+                    details={"exception_type": type(exc).__name__},
+                    backoff_seconds=self.settings.project_backoff_seconds,
+                )
+                continue
         return count
 
     def poll_jira_control_comments(self, project_key: str, issue_keys: list[str] | None = None) -> int:
@@ -1555,9 +1774,13 @@ class OrchestratorService:
         return not existing_job
 
     def dispatch_jobs(self) -> None:
+        self.store.reap_expired_control_flags()
+        self.store.reap_stale_scheduler_leases()
         if self.store.control_flag_value("global", "*", "pause") == "paused":
             return
         self.collect_finished_threads()
+        if not self.runtime_tools_ready():
+            return
         for job in self.store.list_runnable_jobs():
             issue_key = job["issue_key"]
             project_key = job["project_key"]
@@ -1575,11 +1798,22 @@ class OrchestratorService:
                 if not dep_status["satisfied"]:
                     blocked_dependencies = dep_status["blocked"] or dep_status["waiting"]
                     if str(job.get("state", "")) != "waiting_dependency" or parse_blocked_dependencies(job.get("blocked_dependencies_json")) != blocked_dependencies:
+                        if state_age_seconds(job) >= getattr(
+                            self.settings,
+                            "waiting_dependency_warn_seconds",
+                            DEFAULT_WAITING_DEPENDENCY_WARN_SECONDS,
+                        ):
+                            gate_reason = (
+                                "Waiting for dependency issue(s) before this work can start. "
+                                "This wait exceeded the warning threshold; replan or resolve the dependency."
+                            )
+                        else:
+                            gate_reason = "Waiting for dependency issue(s) before this work can start."
                         self.store.update_job(
                             issue_key,
                             state="waiting_dependency",
                             gate_state="waiting_dependency",
-                            gate_reason="Waiting for dependency issue(s) before this work can start.",
+                            gate_reason=gate_reason,
                             blocked_dependencies_json=json.dumps(blocked_dependencies, ensure_ascii=False),
                         )
                         with contextlib.suppress(Exception):
@@ -1610,6 +1844,7 @@ class OrchestratorService:
                 max_parallel_per_project=int(
                     getattr(self.settings, "max_parallel_per_project", DEFAULT_MAX_PARALLEL_PER_PROJECT)
                 ),
+                lease_ttl_seconds=int(getattr(self.settings, "lease_ttl_seconds", DEFAULT_LEASE_TTL_SECONDS)),
             ):
                 continue
             thread = threading.Thread(
@@ -1622,6 +1857,42 @@ class OrchestratorService:
                 self.active_threads[issue_key] = thread
             thread.start()
 
+    def runtime_tools_ready(self) -> bool:
+        if getattr(self.settings, "codex_toolchain_compatible", True) is False:
+            self.store.record_service_health(
+                "global",
+                "*",
+                "toolchain",
+                "degraded",
+                "Codex CLI is unavailable or incompatible. Run `platform toolchain doctor`.",
+                details={
+                    "codex_binary": getattr(self.settings, "codex_resolved_binary", ""),
+                    "codex_version": getattr(self.settings, "codex_resolved_version", ""),
+                },
+            )
+            return False
+        self.store.record_service_health(
+            "global",
+            "*",
+            "toolchain",
+            "healthy",
+            details={
+                "codex_binary": getattr(self.settings, "codex_resolved_binary", ""),
+                "codex_version": getattr(self.settings, "codex_resolved_version", ""),
+            },
+        )
+        if isinstance(self.settings, WorkerSettings) and not shutil.which("claude"):
+            self.store.record_service_health(
+                "global",
+                "*",
+                "claude",
+                "degraded",
+                "Claude Code CLI is not on PATH for the worker user.",
+            )
+            return False
+        self.store.record_service_health("global", "*", "claude", "healthy")
+        return True
+
     def collect_finished_threads(self) -> None:
         with self.thread_lock:
             finished = [issue_key for issue_key, thread in self.active_threads.items() if not thread.is_alive()]
@@ -1630,6 +1901,7 @@ class OrchestratorService:
 
     def process_job(self, issue_key: str) -> None:
         try:
+            self.heartbeat_job_lease(issue_key)
             self._process_job(issue_key)
         except Exception as exc:  # pragma: no cover - defensive logging path
             outcome = retry_transient_or_fail_issue_job(
@@ -1646,6 +1918,16 @@ class OrchestratorService:
             if job:
                 self.store.release_lease(job["repo_path"], issue_key)
                 self.store.update_job(issue_key, active_pid=None)
+
+    def heartbeat_job_lease(self, issue_key: str, *, ttl_seconds: int | None = None) -> None:
+        job = self.store.get_job(issue_key)
+        if not job:
+            return
+        self.store.heartbeat_lease(
+            str(job.get("repo_path", "")),
+            issue_key,
+            lease_ttl_seconds=ttl_seconds or int(getattr(self.settings, "lease_ttl_seconds", DEFAULT_LEASE_TTL_SECONDS)),
+        )
 
     def _process_job(self, issue_key: str) -> None:
         job = self.store.get_job(issue_key)
@@ -1667,6 +1949,7 @@ class OrchestratorService:
         )
 
         if job["state"] in {"queued", "planning", "paused"}:
+            self.heartbeat_job_lease(issue_key)
             self.store.update_job(issue_key, state="planning")
             self.refresh_issue_report(issue_key)
             ensure_issue_spec(issue_key, worktree_path, str(issue["fields"].get("summary", issue_key)))
@@ -1696,6 +1979,10 @@ class OrchestratorService:
         if not job:
             return
         if job["state"] in {"planning", "coding", "queued"}:
+            self.heartbeat_job_lease(
+                issue_key,
+                ttl_seconds=int(getattr(self.settings, "codex_exec_timeout_seconds", DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS)) + 300,
+            )
             self.store.update_job(issue_key, state="coding")
             self.refresh_issue_report(issue_key)
             plan_step = self.store.latest_step(issue_key, "planning")
@@ -1772,6 +2059,7 @@ class OrchestratorService:
         if not job:
             return
         if job["state"] in {"coding", "reviewing"}:
+            self.heartbeat_job_lease(issue_key)
             self.store.update_job(issue_key, state="reviewing")
             self.refresh_issue_report(issue_key)
             review_result = run_codex_review(
@@ -1819,6 +2107,7 @@ class OrchestratorService:
         if not job:
             return
         if job["state"] in {"reviewing", "pr_open"}:
+            self.heartbeat_job_lease(issue_key)
             self.store.update_job(issue_key, state="pr_open")
             self.refresh_issue_report(issue_key)
             pr = ensure_pull_request(
@@ -1894,9 +2183,27 @@ class OrchestratorService:
                 updates["gate_reason"] = gate["reason"]
                 updates["blocked_dependencies_json"] = "[]"
             elif (
+                state == "waiting_checks"
+                and not check_summary["passed"]
+                and state_age_seconds(job) >= getattr(
+                    self.settings,
+                    "pending_check_timeout_seconds",
+                    DEFAULT_PENDING_CHECK_TIMEOUT_SECONDS,
+                )
+            ):
+                state = "gate_waiting_human"
+                reason = (
+                    "GitHub checks are still pending after the timeout window. "
+                    "Check Actions/ruleset/merge_group configuration; independent work can continue."
+                )
+                updates["latest_error"] = reason
+                updates["gate_state"] = "pending_checks_timeout"
+                updates["gate_reason"] = reason
+                updates["blocked_dependencies_json"] = "[]"
+            elif (
                 state in {"waiting_checks", "gate_failed", "gate_waiting_human"}
                 and check_summary["passed"]
-                and str(job.get("gate_state", "")) != "review_changes_requested"
+                and str(job.get("gate_state", "")) not in {"review_changes_requested", "merge_queue_stuck"}
             ):
                 state = "waiting_review"
                 updates["review_requested_at"] = str(job.get("review_requested_at") or now_iso())
@@ -1910,7 +2217,11 @@ class OrchestratorService:
                         pr["url"],
                         existing_timestamp=str(job.get("review_fallback_requested_at", "")),
                     )
-            if state in {"waiting_review", "gate_waiting_human"}:
+            if state == "waiting_review" or (
+                state == "gate_waiting_human"
+                and check_summary["passed"]
+                and str(updates.get("gate_state") or job.get("gate_state", "")) in {"intentional_gate", "review_changes_requested"}
+            ):
                 job_snapshot = {**job, **updates}
                 state, extra_updates = self.resolve_review_state(
                     job=job_snapshot,
@@ -1946,11 +2257,26 @@ class OrchestratorService:
                 updates["gate_reason"] = ""
                 updates["blocked_dependencies_json"] = "[]"
             if state == "ready_for_merge" and getattr(self.settings, "github_merge_policy", DEFAULT_GITHUB_MERGE_POLICY) == "merge_queue":
-                merge_result = ensure_github_auto_merge(worktree_path, pr.get("url", ""))
-                if merge_result.get("warning"):
-                    self.store.record_step(job["issue_key"], "merge_queue", "warning", merge_result)
-                elif merge_result.get("enabled"):
-                    self.store.record_step(job["issue_key"], "merge_queue", "success", merge_result)
+                if str(job.get("state", "")) == "ready_for_merge" and state_age_seconds(job) >= getattr(
+                    self.settings,
+                    "merge_queue_stuck_seconds",
+                    DEFAULT_MERGE_QUEUE_STUCK_SECONDS,
+                ):
+                    state = "gate_waiting_human"
+                    reason = (
+                        "GitHub merge queue or auto-merge did not progress before timeout. "
+                        "Inspect branch protection, required checks, and queue status."
+                    )
+                    updates["latest_error"] = reason
+                    updates["gate_state"] = "merge_queue_stuck"
+                    updates["gate_reason"] = reason
+                    updates["blocked_dependencies_json"] = "[]"
+                else:
+                    merge_result = ensure_github_auto_merge(worktree_path, pr.get("url", ""))
+                    if merge_result.get("warning"):
+                        self.store.record_step(job["issue_key"], "merge_queue", "warning", merge_result)
+                    elif merge_result.get("enabled"):
+                        self.store.record_step(job["issue_key"], "merge_queue", "success", merge_result)
             updates["state"] = state
             self.store.update_job(job["issue_key"], **updates)
             self.refresh_issue_report(
@@ -2161,6 +2487,7 @@ class OrchestratorStore:
                     requested_action TEXT DEFAULT '',
                     review_requested_at TEXT DEFAULT '',
                     review_fallback_requested_at TEXT DEFAULT '',
+                    state_entered_at TEXT DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -2174,7 +2501,11 @@ class OrchestratorStore:
                     issue_key TEXT PRIMARY KEY,
                     project_key TEXT NOT NULL,
                     conflict_group TEXT NOT NULL,
-                    acquired_at TEXT NOT NULL
+                    acquired_at TEXT NOT NULL,
+                    heartbeat_at TEXT DEFAULT '',
+                    expires_at TEXT DEFAULT '',
+                    pid INTEGER,
+                    thread_name TEXT DEFAULT ''
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduler_leases_conflict
                     ON scheduler_leases(repo_path, conflict_group);
@@ -2259,8 +2590,24 @@ class OrchestratorStore:
                     scope_key TEXT NOT NULL,
                     flag TEXT NOT NULL,
                     value TEXT NOT NULL,
+                    reason TEXT DEFAULT '',
+                    created_by TEXT DEFAULT '',
+                    expires_at TEXT DEFAULT '',
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (scope_type, scope_key, flag)
+                );
+                CREATE TABLE IF NOT EXISTS service_health (
+                    scope_type TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    component TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    message TEXT DEFAULT '',
+                    details_json TEXT DEFAULT '{}',
+                    last_success_at TEXT DEFAULT '',
+                    last_error_at TEXT DEFAULT '',
+                    backoff_until TEXT DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (scope_type, scope_key, component)
                 );
                 CREATE TABLE IF NOT EXISTS processed_comments (
                     comment_id TEXT PRIMARY KEY,
@@ -2316,8 +2663,22 @@ class OrchestratorStore:
                 ("gate_state", "TEXT DEFAULT ''"),
                 ("gate_reason", "TEXT DEFAULT ''"),
                 ("blocked_dependencies_json", "TEXT DEFAULT '[]'"),
+                ("state_entered_at", "TEXT DEFAULT ''"),
             ):
                 self._ensure_column(connection, "jobs", name, definition)
+            for name, definition in (
+                ("heartbeat_at", "TEXT DEFAULT ''"),
+                ("expires_at", "TEXT DEFAULT ''"),
+                ("pid", "INTEGER"),
+                ("thread_name", "TEXT DEFAULT ''"),
+            ):
+                self._ensure_column(connection, "scheduler_leases", name, definition)
+            for name, definition in (
+                ("reason", "TEXT DEFAULT ''"),
+                ("created_by", "TEXT DEFAULT ''"),
+                ("expires_at", "TEXT DEFAULT ''"),
+            ):
+                self._ensure_column(connection, "control_flags", name, definition)
 
     def _ensure_column(self, connection: sqlite3.Connection, table: str, name: str, definition: str) -> None:
         existing = {
@@ -2512,6 +2873,7 @@ class OrchestratorStore:
         for batch in batches:
             batch["jobs"] = self.list_jobs_for_batch(str(batch["batch_id"]))
             batch["effective_state"] = batch_effective_state(batch, batch["jobs"])
+            batch["schedule"] = batch_schedule_summary(batch["jobs"])
         return batches
 
     def upsert_work_unit(
@@ -2685,10 +3047,11 @@ class OrchestratorStore:
             connection.execute(
                 """
                 INSERT INTO jobs (
-                    issue_key, project_key, repo_path, state, status_name, summary, created_at, updated_at
-                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)
+                    issue_key, project_key, repo_path, state, status_name, summary,
+                    state_entered_at, created_at, updated_at
+                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)
                 """,
-                (issue_key, project_key, repo_path, status, summary, now_iso(), now_iso()),
+                (issue_key, project_key, repo_path, status, summary, now_iso(), now_iso(), now_iso()),
             )
 
     def list_jobs(
@@ -2763,17 +3126,28 @@ class OrchestratorStore:
         conflict_group: str = "",
         max_parallel_per_repo: int = 1,
         max_parallel_per_project: int = 1,
+        lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
     ) -> bool:
         if max_parallel_per_repo <= 1 and max_parallel_per_project <= 1 and not conflict_group:
             return self._acquire_legacy_lease(repo_path, issue_key)
         group = conflict_group or issue_key
         project = project_key or str((self.get_job(issue_key) or {}).get("project_key", ""))
+        now = now_iso()
+        expires_at = iso_after_seconds(lease_ttl_seconds)
         with self._connection() as connection:
             existing = connection.execute(
                 "SELECT issue_key FROM scheduler_leases WHERE issue_key = ?",
                 (issue_key,),
             ).fetchone()
             if existing:
+                connection.execute(
+                    """
+                    UPDATE scheduler_leases
+                    SET heartbeat_at=?, expires_at=?, pid=?, thread_name=?
+                    WHERE issue_key=?
+                    """,
+                    (now, expires_at, os.getpid(), threading.current_thread().name, issue_key),
+                )
                 return True
             repo_count = connection.execute(
                 "SELECT COUNT(*) AS count FROM scheduler_leases WHERE repo_path = ?",
@@ -2798,10 +3172,23 @@ class OrchestratorStore:
                 return False
             connection.execute(
                 """
-                INSERT INTO scheduler_leases (repo_path, issue_key, project_key, conflict_group, acquired_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO scheduler_leases (
+                    repo_path, issue_key, project_key, conflict_group,
+                    acquired_at, heartbeat_at, expires_at, pid, thread_name
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (repo_path, issue_key, project, group, now_iso()),
+                (
+                    repo_path,
+                    issue_key,
+                    project,
+                    group,
+                    now,
+                    now,
+                    expires_at,
+                    os.getpid(),
+                    threading.current_thread().name,
+                ),
             )
         return True
 
@@ -2843,28 +3230,110 @@ class OrchestratorStore:
             connection.execute("DELETE FROM leases")
             connection.execute("DELETE FROM scheduler_leases")
 
+    def heartbeat_lease(
+        self,
+        repo_path: str | None,
+        issue_key: str,
+        *,
+        lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
+    ) -> None:
+        if not repo_path:
+            return
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE scheduler_leases
+                SET heartbeat_at=?, expires_at=?, pid=?, thread_name=?
+                WHERE repo_path=? AND issue_key=?
+                """,
+                (
+                    now_iso(),
+                    iso_after_seconds(lease_ttl_seconds),
+                    os.getpid(),
+                    threading.current_thread().name,
+                    repo_path,
+                    issue_key,
+                ),
+            )
+
+    def list_stale_scheduler_leases(self) -> list[dict[str, Any]]:
+        now = now_iso()
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM scheduler_leases
+                WHERE expires_at != '' AND expires_at <= ?
+                ORDER BY expires_at ASC
+                """,
+                (now,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def reap_stale_scheduler_leases(self) -> list[dict[str, Any]]:
+        stale = self.list_stale_scheduler_leases()
+        for lease in stale:
+            issue_key = str(lease.get("issue_key", ""))
+            repo_path = str(lease.get("repo_path", ""))
+            job = self.get_job(issue_key)
+            self.release_lease(repo_path, issue_key)
+            if job and str(job.get("state", "")) in {"planning", "coding", "reviewing", "pr_open"}:
+                self.update_job(
+                    issue_key,
+                    state="queued",
+                    active_pid=None,
+                    requested_action="",
+                    latest_error="Recovered from stale scheduler lease; requeued at last safe checkpoint.",
+                )
+            if issue_key:
+                self.record_step(
+                    issue_key,
+                    "stale_lease_recovered",
+                    "warning",
+                    {
+                        "summary": "Stale scheduler lease was released.",
+                        "lease": lease,
+                    },
+                )
+        return stale
+
     def recover_inflight_jobs(self) -> None:
         with self._connection() as connection:
+            now = now_iso()
             connection.execute(
                 """
                 UPDATE jobs
                 SET state='queued',
                     active_pid=NULL,
                     requested_action='',
+                    state_entered_at=?,
                     updated_at=?
                 WHERE state IN ('planning', 'coding', 'reviewing', 'pr_open')
                 """,
-                (now_iso(),),
+                (now, now),
             )
 
     def update_job(self, issue_key: str, **fields: Any) -> None:
         if not fields:
             return
         safe_fields = dict(fields)
-        safe_fields["updated_at"] = now_iso()
-        assignments = ", ".join(f"{key} = ?" for key in safe_fields)
-        params = list(safe_fields.values()) + [issue_key]
+        now = now_iso()
         with self._connection() as connection:
+            row = connection.execute(
+                "SELECT state, state_entered_at FROM jobs WHERE issue_key = ?",
+                (issue_key,),
+            ).fetchone()
+            if (
+                "state" in safe_fields
+                and "state_entered_at" not in safe_fields
+                and row
+                and str(row["state"]) != str(safe_fields["state"])
+            ):
+                safe_fields["state_entered_at"] = now
+            elif "state_entered_at" not in safe_fields and row and not str(row["state_entered_at"] or ""):
+                safe_fields["state_entered_at"] = now
+            safe_fields["updated_at"] = now
+            assignments = ", ".join(f"{key} = ?" for key in safe_fields)
+            params = list(safe_fields.values()) + [issue_key]
             connection.execute(f"UPDATE jobs SET {assignments} WHERE issue_key = ?", params)
 
     def record_step(
@@ -2919,20 +3388,36 @@ class OrchestratorStore:
             ).fetchone()
             return str(row["comment_id"]) if row else ""
 
-    def set_control_flag(self, scope_type: str, scope_key: str, flag: str, value: str) -> None:
+    def set_control_flag(
+        self,
+        scope_type: str,
+        scope_key: str,
+        flag: str,
+        value: str,
+        *,
+        reason: str = "",
+        created_by: str = "",
+        expires_at: str = "",
+    ) -> None:
         with self._connection() as connection:
             connection.execute(
                 """
-                INSERT INTO control_flags (scope_type, scope_key, flag, value, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO control_flags (
+                    scope_type, scope_key, flag, value, reason, created_by, expires_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(scope_type, scope_key, flag) DO UPDATE SET
                     value=excluded.value,
+                    reason=excluded.reason,
+                    created_by=excluded.created_by,
+                    expires_at=excluded.expires_at,
                     updated_at=excluded.updated_at
                 """,
-                (scope_type, scope_key, flag, value, now_iso()),
+                (scope_type, scope_key, flag, value, reason, created_by, expires_at, now_iso()),
             )
 
     def control_flag_value(self, scope_type: str, scope_key: str, flag: str) -> str:
+        self.reap_expired_control_flags()
         with self._connection() as connection:
             row = connection.execute(
                 """
@@ -2943,12 +3428,114 @@ class OrchestratorStore:
             ).fetchone()
             return str(row["value"]) if row else ""
 
+    def reap_expired_control_flags(self) -> int:
+        now = now_iso()
+        with self._connection() as connection:
+            expired = connection.execute(
+                """
+                SELECT * FROM control_flags
+                WHERE expires_at != '' AND expires_at <= ?
+                """,
+                (now,),
+            ).fetchall()
+            connection.execute(
+                """
+                DELETE FROM control_flags
+                WHERE expires_at != '' AND expires_at <= ?
+                """,
+                (now,),
+            )
+        return len(expired)
+
     def list_control_flags(self) -> list[dict[str, Any]]:
+        self.reap_expired_control_flags()
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM control_flags ORDER BY scope_type, scope_key, flag"
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def record_service_health(
+        self,
+        scope_type: str,
+        scope_key: str,
+        component: str,
+        status: str,
+        message: str = "",
+        *,
+        details: dict[str, Any] | None = None,
+        backoff_seconds: int = 0,
+    ) -> None:
+        current = self.service_health(scope_type, scope_key, component)
+        now = now_iso()
+        last_success_at = now if status == "healthy" else str(current.get("last_success_at", ""))
+        last_error_at = now if status != "healthy" else str(current.get("last_error_at", ""))
+        backoff_until = iso_after_seconds(backoff_seconds) if status != "healthy" and backoff_seconds else ""
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO service_health (
+                    scope_type, scope_key, component, status, message, details_json,
+                    last_success_at, last_error_at, backoff_until, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scope_type, scope_key, component) DO UPDATE SET
+                    status=excluded.status,
+                    message=excluded.message,
+                    details_json=excluded.details_json,
+                    last_success_at=excluded.last_success_at,
+                    last_error_at=excluded.last_error_at,
+                    backoff_until=excluded.backoff_until,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    scope_type,
+                    scope_key,
+                    component,
+                    status,
+                    message,
+                    json.dumps(details or {}, ensure_ascii=False),
+                    last_success_at,
+                    last_error_at,
+                    backoff_until,
+                    now,
+                ),
+            )
+
+    def service_health(self, scope_type: str, scope_key: str, component: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM service_health
+                WHERE scope_type=? AND scope_key=? AND component=?
+                """,
+                (scope_type, scope_key, component),
+            ).fetchone()
+            return dict(row) if row else {}
+
+    def service_backoff_active(self, scope_type: str, scope_key: str, component: str) -> bool:
+        row = self.service_health(scope_type, scope_key, component)
+        return iso_expired(str(row.get("backoff_until", ""))) is False if row.get("backoff_until") else False
+
+    def list_service_health(self, project_key: str | None = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_key:
+            clauses.append("(scope_key = ? OR scope_type = 'global')")
+            params.append(project_key)
+        query = "SELECT * FROM service_health"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY scope_type, scope_key, component"
+        with self._connection() as connection:
+            rows = connection.execute(query, params).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            with contextlib.suppress(json.JSONDecodeError):
+                item["details"] = json.loads(str(item.get("details_json") or "{}"))
+            result.append(item)
+        return result
 
     def set_requested_action(self, issue_key: str, action: str) -> None:
         self.update_job(issue_key, requested_action=action)
@@ -3074,6 +3661,27 @@ def load_worker_settings(
         failure_max_attempts=max(1, int(failure_config.get("max_attempts", DEFAULT_FAILURE_MAX_ATTEMPTS))),
         failure_backlog_statuses=backlog_statuses or DEFAULT_FAILURE_BACKLOG_STATUSES,
         github_merge_policy=str(config.get("github", {}).get("merge_policy", DEFAULT_GITHUB_MERGE_POLICY)),
+        control_flag_ttl_seconds=max(
+            0,
+            int(scheduler_config.get("control_flag_ttl_seconds", DEFAULT_CONTROL_FLAG_TTL_SECONDS)),
+        ),
+        lease_ttl_seconds=max(60, int(scheduler_config.get("lease_ttl_seconds", DEFAULT_LEASE_TTL_SECONDS))),
+        pending_check_timeout_seconds=max(
+            60,
+            int(timeout_config.get("github_checks_seconds", DEFAULT_PENDING_CHECK_TIMEOUT_SECONDS)),
+        ),
+        merge_queue_stuck_seconds=max(
+            60,
+            int(timeout_config.get("merge_queue_seconds", DEFAULT_MERGE_QUEUE_STUCK_SECONDS)),
+        ),
+        waiting_dependency_warn_seconds=max(
+            60,
+            int(scheduler_config.get("waiting_dependency_warn_seconds", DEFAULT_WAITING_DEPENDENCY_WARN_SECONDS)),
+        ),
+        project_backoff_seconds=max(
+            1,
+            int(scheduler_config.get("project_backoff_seconds", DEFAULT_PROJECT_BACKOFF_SECONDS)),
+        ),
         claude_timeout_seconds=max(1, int(timeout_config.get("claude_seconds", DEFAULT_CLAUDE_TIMEOUT_SECONDS))),
         codex_exec_timeout_seconds=max(1, int(timeout_config.get("codex_exec_seconds", DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS))),
         codex_review_timeout_seconds=max(
@@ -3199,11 +3807,17 @@ def default_orchestrator_config() -> dict[str, Any]:
             "max_parallel_per_project": DEFAULT_MAX_PARALLEL_PER_PROJECT,
             "contract_handshake": DEFAULT_CONTRACT_HANDSHAKE,
             "max_baton_rounds": DEFAULT_MAX_BATON_ROUNDS,
+            "control_flag_ttl_seconds": DEFAULT_CONTROL_FLAG_TTL_SECONDS,
+            "lease_ttl_seconds": DEFAULT_LEASE_TTL_SECONDS,
+            "waiting_dependency_warn_seconds": DEFAULT_WAITING_DEPENDENCY_WARN_SECONDS,
+            "project_backoff_seconds": DEFAULT_PROJECT_BACKOFF_SECONDS,
         },
         "timeouts": {
             "claude_seconds": DEFAULT_CLAUDE_TIMEOUT_SECONDS,
             "codex_exec_seconds": DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
             "codex_review_seconds": DEFAULT_LOCAL_REVIEW_TIMEOUT_SECONDS,
+            "github_checks_seconds": DEFAULT_PENDING_CHECK_TIMEOUT_SECONDS,
+            "merge_queue_seconds": DEFAULT_MERGE_QUEUE_STUCK_SECONDS,
         },
         "failure": {
             "max_attempts": DEFAULT_FAILURE_MAX_ATTEMPTS,
@@ -3747,6 +4361,62 @@ def jira_search_jql(settings: WorkerSettings, jql: str, *, max_results: int = 50
     return list(payload.get("issues", [])) if isinstance(payload, dict) else []
 
 
+def find_dependency_cycle_nodes(dependencies_by_issue: dict[str, list[str]]) -> set[str]:
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    cycle_nodes: set[str] = set()
+
+    def visit(node: str, path: list[str]) -> None:
+        if node in visiting:
+            if node in path:
+                cycle_nodes.update(path[path.index(node):])
+            else:
+                cycle_nodes.add(node)
+            return
+        if node in visited:
+            return
+        visiting.add(node)
+        path.append(node)
+        for dependency in dependencies_by_issue.get(node, []):
+            if dependency in dependencies_by_issue:
+                visit(dependency, path)
+        path.pop()
+        visiting.remove(node)
+        visited.add(node)
+
+    for issue_key in dependencies_by_issue:
+        visit(issue_key, [])
+    return cycle_nodes
+
+
+def mark_dependency_cycles(store: OrchestratorStore, batch_id: str) -> list[str]:
+    jobs = store.list_jobs_for_batch(batch_id)
+    dependencies = {
+        str(job.get("issue_key", "")): parse_dependencies(job.get("dependencies_json"))
+        for job in jobs
+    }
+    cycle_nodes = sorted(find_dependency_cycle_nodes(dependencies))
+    for issue_key in cycle_nodes:
+        store.update_job(
+            issue_key,
+            state="gate_failed",
+            gate_state="dependency_cycle",
+            gate_reason="Dependency cycle detected in batch plan. Run `platform orchestrator batch replan --batch <ID>` after fixing dependencies.",
+            blocked_dependencies_json="[]",
+        )
+        store.record_step(
+            issue_key,
+            "dependency_cycle",
+            "failed",
+            {
+                "summary": "Dependency cycle detected.",
+                "batch_id": batch_id,
+                "cycle_issues": cycle_nodes,
+            },
+        )
+    return cycle_nodes
+
+
 def create_batch_from_jql(
     *,
     store: OrchestratorStore,
@@ -3827,7 +4497,102 @@ def create_batch_from_jql(
             contract=contract,
             created_by="claude-batch",
         )
-    return {"batch_id": batch_id, "project_key": project_key, "issue_count": len(issue_summaries), "plan": plan}
+    cycle_issues = mark_dependency_cycles(store, batch_id)
+    return {
+        "batch_id": batch_id,
+        "project_key": project_key,
+        "issue_count": len(issue_summaries),
+        "cycle_issues": cycle_issues,
+        "plan": plan,
+    }
+
+
+def replan_batch(*, store: OrchestratorStore, settings: WorkerSettings, batch_id: str) -> dict[str, Any]:
+    batch = store.batch(batch_id)
+    if not batch:
+        raise OrchestratorError(f"Batch not found: {batch_id}")
+    project = store.project(str(batch["project_key"]))
+    if not project:
+        raise OrchestratorError(f"Project is not registered: {batch.get('project_key')}")
+    jobs = store.list_jobs_for_batch(batch_id)
+    issue_summaries = [
+        {
+            "issue_key": str(job.get("issue_key", "")),
+            "summary": str(job.get("summary", "")),
+            "status": str(job.get("state", "")),
+        }
+        for job in jobs
+        if str(job.get("state", "")) != "done"
+    ]
+    if not issue_summaries:
+        return {"batch_id": batch_id, "replanned_issue_count": 0, "cycle_issues": [], "plan": {}}
+    plan = run_claude_batch_plan(
+        store=store,
+        settings=settings,
+        project=project,
+        batch_id=batch_id,
+        jql=str(batch.get("jql", "")),
+        issues=issue_summaries,
+        max_parallel=int(batch.get("max_parallel") or DEFAULT_MAX_PARALLEL_PER_REPO),
+    )
+    store.create_batch(
+        batch_id=batch_id,
+        project_key=str(batch["project_key"]),
+        jql=str(batch.get("jql", "")),
+        max_parallel=int(batch.get("max_parallel") or DEFAULT_MAX_PARALLEL_PER_REPO),
+        summary=str(plan.get("summary", "")),
+        design_memo=str(plan.get("design_memo", "")),
+    )
+    planned_units = {
+        str(item.get("issue_key", "")).upper(): item
+        for item in plan.get("work_units", [])
+        if isinstance(item, dict)
+    }
+    updated = 0
+    for job in jobs:
+        issue_key = str(job.get("issue_key", "")).upper()
+        if str(job.get("state", "")) == "done":
+            continue
+        unit = planned_units.get(issue_key, {})
+        contract = normalize_task_contract(
+            unit.get("task_contract") if isinstance(unit.get("task_contract"), dict) else {
+                "issue_key": issue_key,
+                "goal": str(job.get("summary", "")),
+                "files_in_scope": [],
+                "constraints": [],
+                "dependencies": unit.get("dependencies", []),
+            },
+            issue_key=issue_key,
+        )
+        dependencies = list_of_strings(unit.get("dependencies") or contract.get("dependencies") or [])
+        conflict_group = str(unit.get("conflict_group") or derive_conflict_group(contract) or issue_key)
+        store.upsert_work_unit(
+            issue_key=issue_key,
+            batch_id=batch_id,
+            project_key=str(batch["project_key"]),
+            repo_path=str(job.get("repo_path") or project.get("repo_path") or ""),
+            conflict_group=conflict_group,
+            dependencies=dependencies,
+            contract=contract,
+        )
+        if str(job.get("state", "")) == "waiting_dependency":
+            refreshed = store.get_job(issue_key)
+            if dependency_status(store, refreshed).get("satisfied"):
+                store.update_job(
+                    issue_key,
+                    state="queued",
+                    gate_state="",
+                    gate_reason="",
+                    blocked_dependencies_json="[]",
+                )
+        updated += 1
+    cycle_issues = mark_dependency_cycles(store, batch_id)
+    return {
+        "batch_id": batch_id,
+        "replanned_issue_count": updated,
+        "cycle_issues": cycle_issues,
+        "plan": plan,
+    }
 
 
 def run_claude_batch_plan(
@@ -5554,12 +6319,45 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def seconds_since(value: str) -> int:
+def parse_iso(value: str | None) -> datetime | None:
     if not value:
-        return 0
+        return None
     try:
-        started_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def iso_after_seconds(seconds: int | None) -> str:
+    if seconds is None:
+        return ""
+    return (datetime.now(timezone.utc) + timedelta(seconds=int(seconds))).replace(microsecond=0).isoformat()
+
+
+def iso_expired(value: str | None) -> bool:
+    parsed = parse_iso(value)
+    return bool(parsed and parsed <= datetime.now(timezone.utc))
+
+
+def parse_duration_seconds(value: str | None, default: int) -> int:
+    text = str(value or "").strip().lower()
+    if not text:
+        return default
+    match = re.fullmatch(r"(\d+)([smhd]?)", text)
+    if not match:
+        return default
+    amount = int(match.group(1))
+    unit = match.group(2) or "s"
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    return amount * multipliers[unit]
+
+
+def seconds_since(value: str) -> int:
+    started_at = parse_iso(value)
+    if not started_at:
         return 0
     return int((datetime.now(timezone.utc) - started_at).total_seconds())
 

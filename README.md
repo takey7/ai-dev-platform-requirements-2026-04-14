@@ -91,9 +91,9 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
   --target /path/to/new-repo \
   --adapter node-ts \
   --issue-project-key PROJ \
-  --confluence-space SPACE \
-  --source-repo takey7/ai-dev-platform-requirements-2026-04-14 \
-  --version v0.2.1
+	  --confluence-space SPACE \
+	  --source-repo takey7/ai-dev-platform-requirements-2026-04-14 \
+	  --version v0.2.2
 ```
 
 `bootstrap` is the canonical platform primitive. `create-project` is a convenience workflow that orchestrates repo creation and then applies the same baseline.
@@ -144,6 +144,8 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
 - Claude planning -> Codex understanding -> Claude approval -> Codex implementation の mediated baton を通す
 - 作業開始時に Jira を `In Progress` / `進行中` / `作業中` へ best-effort transition する
 - PR merge 後だけ Jira を `Done` / `完了` へ best-effort transition する
+- main loop の各 step は exception boundary を持ち、Jira/GitHub/Claude/Codex の一時障害は `service_health.degraded` として隔離する
+- stale lease は dispatch 前に回収し、該当 job を最後の安全 checkpoint へ戻す
 - 既定では `ready_for_merge` 後に GitHub auto-merge / merge queue を有効化する。ローカル autopilot merge は標準経路ではない
 - public HTTPS URL が必要なのは webhook mode を明示した場合だけ
 
@@ -165,9 +167,13 @@ Codex GitHub review の有効化は ChatGPT/Codex settings 側の repo 単位ト
 ### 10. status / pause / resume / cancel
 ```bash
 ./bin/platform orchestrator status --project PROJ
+./bin/platform orchestrator health --project PROJ
 ./bin/platform orchestrator poll --issue PROJ-123
 ./bin/platform orchestrator status --issue PROJ-123 --refresh
 ./bin/platform orchestrator pause --issue PROJ-123
+./bin/platform orchestrator pause --project PROJ --ttl 8h
+./bin/platform orchestrator drain --project PROJ --ttl 8h
+./bin/platform orchestrator undrain --project PROJ
 ./bin/platform orchestrator resume --issue PROJ-123
 ./bin/platform orchestrator cancel --issue PROJ-123
 ./bin/platform orchestrator fail --issue PROJ-123 --backlog --reason "validation failed"
@@ -185,9 +191,10 @@ Jira 側でも次の comment commands を使えます。
 - `/ai unblock`
 - `/ai status`
 - project control issue 専用:
-  - `/ai pause-project`
-  - `/ai resume-project`
-  - `/ai drain-project`
+	  - `/ai pause-project`
+	  - `/ai resume-project`
+	  - `/ai drain-project`
+	  - `/ai undrain-project`
 
 ### 11. 複数 issue を batch で並列実行する
 ```bash
@@ -197,6 +204,7 @@ Jira 側でも次の comment commands を使えます。
   --max-parallel 3
 
 ./bin/platform orchestrator batch status
+./bin/platform orchestrator batch replan --batch PROJ-YYYYMMDDHHMMSS
 ./bin/platform orchestrator batch pause --batch PROJ-YYYYMMDDHHMMSS
 ./bin/platform orchestrator batch resume --batch PROJ-YYYYMMDDHHMMSS
 ./bin/platform orchestrator batch cancel --batch PROJ-YYYYMMDDHHMMSS
@@ -206,10 +214,14 @@ Batch planning は Claude coordinator が DAG / dependency / conflict group / ta
 
 v0.2.1 以降、required checks / Codex review / spec-gate / risk gate で止まった PR は batch 全体を止めず、その issue だけを `gate_failed` または `gate_waiting_human` に隔離します。依存 issue は `waiting_dependency` になり、独立 issue は継続します。
 
+v0.2.2 以降、全体停止は安全上の global stop だけに限定します。通常の外部 API 障害、pending checks、merge queue 停滞、toolchain/login 不備、stale lease、dependency deadlock は `global / project / repo / batch / issue` の最小 scope へ隔離します。
+
 - `gate_waiting_human`: risk approval / changes requested / manual gate 待ち
 - `gate_failed`: required check / spec-gate / security-scan / merge queue failure
 - `waiting_dependency`: 依存先が gate / failed / backlog で止まっているため待機
 - `backlog`: operator が fail/backlog し、Jira を `To Do` / `Backlog` へ戻した状態
+- `blocked`: tool / permission / contract 不備で、その issue の自動継続が危険な状態
+- `service_health.degraded`: 外部サービスや toolchain の一時不調。queue は保持し、他 scope は継続する
 
 ## Recommended tool versions
 - OpenAI / Codex:

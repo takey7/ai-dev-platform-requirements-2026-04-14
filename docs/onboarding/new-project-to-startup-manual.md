@@ -200,12 +200,16 @@ claude -p --permission-mode bypassPermissions \
 status:
 ```bash
 ./bin/platform orchestrator status --project <PROJECT_KEY>
+./bin/platform orchestrator health --project <PROJECT_KEY>
 ./bin/platform orchestrator status --issue <ISSUE_KEY>
 ```
 
 CLI pause/resume/cancel:
 ```bash
 ./bin/platform orchestrator pause --issue <ISSUE_KEY>
+./bin/platform orchestrator pause --project <PROJECT_KEY> --ttl 8h
+./bin/platform orchestrator drain --project <PROJECT_KEY> --ttl 8h
+./bin/platform orchestrator undrain --project <PROJECT_KEY>
 ./bin/platform orchestrator resume --issue <ISSUE_KEY>
 ./bin/platform orchestrator cancel --issue <ISSUE_KEY>
 ```
@@ -221,6 +225,7 @@ project-wide:
 - `/ai pause-project`
 - `/ai resume-project`
 - `/ai drain-project`
+- `/ai undrain-project`
 
 ## 10. GitHub review の確認
 repo 側では automatic Codex review を有効化します。
@@ -265,6 +270,7 @@ worker が止まっていた場合は、GitHub 状態を手動で再取得しま
   --max-parallel 3
 
 ./bin/platform orchestrator batch status
+./bin/platform orchestrator batch replan --batch <BATCH_ID>
 ```
 
 Claude coordinator が batch 内の DAG、依存関係、conflict group、共有設計メモを作ります。Codex は issue 単位の worktree / branch / PR だけを担当します。
@@ -278,6 +284,12 @@ Claude coordinator が batch 内の DAG、依存関係、conflict group、共有
 ```
 
 ## 12. 失敗時の切り分け
+- まず全体停止か issue 隔離かを確認:
+  - `platform orchestrator health --project <PROJECT_KEY>`
+  - `platform doctor --target ~/workspaces/<repo-name>`
+  - `service_health.degraded` は外部 API / toolchain 待ちで、他 project は継続
+  - `gate_*` は PR/gate 待ちで、その issue だけ隔離
+  - `waiting_dependency` は依存先待ちで、並列枠は消費しない
 - Jira issue が拾われない:
   - issue に `ai:auto` label があるか確認
   - status が `To Do` または `Selected for Development` か確認
@@ -299,3 +311,4 @@ Claude coordinator が batch 内の DAG、依存関係、conflict group、共有
 - ローカル autopilot merge は標準経路ではない
 - Jira は作業開始で `In Progress` 相当、PR merge 後だけ `Done` 相当へ移動する
 - transient failure は bounded retry し、上限超過や validation failure は failed/backlog に戻して次 issue へ進む
+- project/global pause と drain は既定 8h TTL。恒久停止は `--no-expire` を明示した時だけ使う

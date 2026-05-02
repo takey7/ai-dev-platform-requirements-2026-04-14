@@ -132,6 +132,7 @@ On a local Mac, install a user LaunchAgent when you want the polling worker to r
 
 If the worker is not running and a job is waiting on GitHub, refresh state manually:
 ```bash
+./bin/platform orchestrator health --project PROJ
 ./bin/platform orchestrator poll --issue PROJ-123
 ./bin/platform orchestrator status --issue PROJ-123
 ```
@@ -157,6 +158,16 @@ If one PR is intentionally stopped by a quality gate, inspect or unblock only th
 ./bin/platform orchestrator gate status --project PROJ
 ./bin/platform orchestrator gate unblock --issue PROJ-123 --reason "operator approved"
 ```
+
+If a whole project should temporarily stop taking new work, prefer TTL-bound drain/pause:
+```bash
+./bin/platform orchestrator drain --project PROJ --ttl 8h
+./bin/platform orchestrator undrain --project PROJ
+./bin/platform orchestrator pause --project PROJ --ttl 8h
+./bin/platform orchestrator resume --project PROJ
+```
+
+`pause --global` should be reserved for safety stops such as credential exposure or destructive-operation risk. Normal gate failures, pending checks, external API errors, stale leases, and dependency waits are isolated to the smallest scope by the v0.2.2 scheduler.
 
 ## 9. Start day-to-day flow
 ```bash

@@ -1,10 +1,10 @@
 # Parallel Batch Orchestrator
 
-v0.2.1 の標準は、Claude と Codex を直接フリーフォーム会話させず、orchestrator が structured contract / trace / approval state を管理する方式です。
+v0.2.x の標準は、Claude と Codex を直接フリーフォーム会話させず、orchestrator が structured contract / trace / approval state を管理する方式です。
 
 ## Why
 
-直接会話は文脈の漂流、監査欠落、無限往復、権限境界の曖昧化が起きやすいです。v0.2.1 は mediated baton に固定します。
+直接会話は文脈の漂流、監査欠落、無限往復、権限境界の曖昧化が起きやすいです。v0.2.x は mediated baton に固定します。
 
 1. Claude coordinator が `task_contract` を作る
 2. Codex worker が編集前に `task_understanding` を返す
@@ -39,10 +39,12 @@ Codex worker は `1 issue = 1 worktree = 1 branch = 1 PR` を守ります。
 ```json
 {
   "scheduler": {
-    "max_parallel_per_repo": 3,
-    "max_parallel_per_project": 5,
-    "contract_handshake": "required",
-    "max_baton_rounds": 2
+	"max_parallel_per_repo": 3,
+	"max_parallel_per_project": 5,
+	"contract_handshake": "required",
+	"max_baton_rounds": 2,
+	"lease_ttl_seconds": 1800,
+	"waiting_dependency_warn_seconds": 86400
   },
   "failure": {
     "max_attempts": 2,
@@ -66,6 +68,8 @@ Quality gate failure は terminal failure と同じ扱いにしません。requi
 - `gate_failed`: required check、spec-gate、security-scan、merge queue removal
 - `waiting_dependency`: 依存先が gate / failed / backlog のため待機。並列枠は消費しない
 - `backlog`: operator が fail/backlog し、Jira を `To Do` / `Backlog` 相当に戻した terminal state
+- `blocked`: tool / permission / contract 不備。品質 gate と混同しない
+- `service_health.degraded`: 外部サービスや toolchain の不調。job を fail/backlog せず queue を保持する
 
 Gate 状態の確認と解除:
 
@@ -73,6 +77,12 @@ Gate 状態の確認と解除:
 ./bin/platform orchestrator gate status --batch PROJ-YYYYMMDDHHMMSS
 ./bin/platform orchestrator gate status --project PROJ
 ./bin/platform orchestrator gate unblock --issue PROJ-123 --reason "required check fixed"
+```
+
+Deadlock や過剰な conflict group がある場合は Claude coordinator に再計画させます。
+
+```bash
+./bin/platform orchestrator batch replan --batch PROJ-YYYYMMDDHHMMSS
 ```
 
 Jira comment でも明示解除できます。
@@ -105,7 +115,7 @@ Terminal failure の処理:
 
 ## Merge Policy
 
-GitHub が最終統制面です。v0.2.1 の既定は `github.merge_policy = "merge_queue"` です。
+GitHub が最終統制面です。v0.2.x の既定は `github.merge_policy = "merge_queue"` です。
 
 Worker は PR が `ready_for_merge` になった後、`gh pr merge --auto --merge` で GitHub auto-merge / merge queue を有効化します。branch protection、required checks、merge queue の実際の判定は GitHub 側に委ねます。
 
@@ -135,6 +145,17 @@ Issue:
 ./bin/platform orchestrator cancel --issue PROJ-123
 ```
 
+Project:
+
+```bash
+./bin/platform orchestrator drain --project PROJ --ttl 8h
+./bin/platform orchestrator undrain --project PROJ
+./bin/platform orchestrator pause --project PROJ --ttl 8h
+./bin/platform orchestrator resume --project PROJ
+```
+
+Project/global pause and drain default to an 8h TTL. Use `--no-expire` only for deliberate maintenance. This prevents forgotten manual stops from blocking future development.
+
 Jira comment commands:
 
 ```text
@@ -143,4 +164,7 @@ Jira comment commands:
 /ai retry
 /ai cancel
 /ai status
+/ai unblock
+/ai drain-project
+/ai undrain-project
 ```
