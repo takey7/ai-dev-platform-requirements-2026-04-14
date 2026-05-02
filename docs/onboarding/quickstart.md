@@ -140,6 +140,7 @@ For a guided first run, use [first-project-walkthrough.md](first-project-walkthr
 
 For Codex GitHub review setup, use [codex-github-review.md](codex-github-review.md).
 For mediated baton and parallel batch operation, use [parallel-batch-orchestrator.md](parallel-batch-orchestrator.md).
+For optional Claude Code session import into Codex history, use [codex-external-agent-import.md](codex-external-agent-import.md).
 
 To run multiple independent Jira issues in parallel:
 ```bash
@@ -149,6 +150,12 @@ To run multiple independent Jira issues in parallel:
   --max-parallel 3
 
 ./bin/platform orchestrator batch status
+```
+
+If one PR is intentionally stopped by a quality gate, inspect or unblock only that issue:
+```bash
+./bin/platform orchestrator gate status --project PROJ
+./bin/platform orchestrator gate unblock --issue PROJ-123 --reason "operator approved"
 ```
 
 ## 9. Start day-to-day flow

@@ -230,7 +230,7 @@ worker の動作:
 2. required checks 待ち
 3. Codex review artifact 待ち
 4. 来なければ `@codex review` fallback
-5. それでも来なければ Jira に `blocked` を返す
+5. それでも来なければ Jira に `gate_waiting_human` を返す
 6. review が揃ったら GitHub auto-merge / merge queue を有効化する
 
 確認コマンド:
@@ -246,7 +246,7 @@ worker が止まっていた場合は、GitHub 状態を手動で再取得しま
 ./bin/platform orchestrator status --issue <ISSUE_KEY>
 ```
 
-`@codex review` の comment だけでは完了扱いにしません。GitHub 上の review、または `chatgpt-codex-connector` の `Codex Review:` comment が無い場合は、一定時間後に Jira へ `blocked` として書き戻します。
+`@codex review` の comment だけでは完了扱いにしません。GitHub 上の review、または `chatgpt-codex-connector` の `Codex Review:` comment が無い場合は、一定時間後に Jira へ `gate_waiting_human` として書き戻します。
 
 ## 11. 複数 project で混ざらないことの確認
 以下を project ごとに確認します。
@@ -268,6 +268,14 @@ worker が止まっていた場合は、GitHub 状態を手動で再取得しま
 ```
 
 Claude coordinator が batch 内の DAG、依存関係、conflict group、共有設計メモを作ります。Codex は issue 単位の worktree / branch / PR だけを担当します。
+
+品質ゲートで止まった issue は batch 全体を止めずに隔離されます。
+
+```bash
+./bin/platform orchestrator gate status --project <PROJECT_KEY>
+./bin/platform orchestrator gate unblock --issue <ISSUE_KEY> --reason "operator approved"
+./bin/platform orchestrator fail --issue <ISSUE_KEY> --backlog --reason "return to backlog"
+```
 
 ## 12. 失敗時の切り分け
 - Jira issue が拾われない:

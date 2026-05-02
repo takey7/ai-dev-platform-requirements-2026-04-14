@@ -1,6 +1,6 @@
 # Latest Official Updates Checked
 
-Checked on 2026-04-29.
+Checked on 2026-05-02.
 
 ## OpenAI / Codex
 - Official latest-model guide now targets `gpt-5.5`.
@@ -13,6 +13,7 @@ Checked on 2026-04-29.
   - Codex remains login-based through ChatGPT/GitHub Connector
   - `OPENAI_API_KEY` remains outside the standard local/GitHub review path
   - local validation on Codex CLI `0.125.0` confirmed `gpt-5.5`, `gpt-5.4`, and `gpt-5.3-codex` work with ChatGPT login; `gpt-5.2-codex` was rejected for ChatGPT-login Codex CLI
+  - Codex CLI `0.128.0+` external agent session import is treated as optional user history import, not orchestrator source-of-truth
 
 ## Claude Code
 - Local verified version: `2.1.121`.

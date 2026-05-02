@@ -184,7 +184,7 @@ platform orchestrator register \
 3. add `ai:auto` to one issue in each project
 4. confirm jobs, PRs, and Jira summary comments do not cross projects
 5. confirm `/ai pause` or `/ai status` comments are picked up by polling
-6. confirm Codex review arrives as a real GitHub review or the worker marks the issue blocked after fallback timeout
+6. confirm Codex review arrives as a real GitHub review or the worker marks only that issue `gate_waiting_human` after fallback timeout
 7. confirm Jira moves to `In Progress` / `進行中` / `作業中` after the job starts
 8. confirm Jira does not move to `Done` / `完了` at `ready_for_merge`; it moves only after the PR is merged
 9. confirm independent issues can run in parallel while shared conflict groups serialize

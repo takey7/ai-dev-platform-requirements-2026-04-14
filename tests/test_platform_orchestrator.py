@@ -786,7 +786,8 @@ class PlatformOrchestratorTests(unittest.TestCase):
 
             job = store.get_job("BILL-1")
             self.assertEqual(refreshed, 1)
-            self.assertEqual(job["state"], "blocked")
+            self.assertEqual(job["state"], "gate_waiting_human")
+            self.assertEqual(job["gate_state"], "intentional_gate")
             self.assertIn("Codex review did not arrive", job["latest_error"])
 
     def test_poll_github_jobs_transitions_done_only_after_merge(self) -> None:
@@ -1392,7 +1393,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 orchestrator.transition_jira_issue_to_aliases = original_transition
 
             job = store.get_job("BILL-1")
-            self.assertEqual(job["state"], "failed")
+            self.assertEqual(job["state"], "backlog")
             self.assertEqual(job["status_name"], "To Do")
             self.assertEqual(job["attempt_count"], 1)
             self.assertTrue(store.acquire_lease(repo, "BILL-2"))
@@ -1440,8 +1441,8 @@ class PlatformOrchestratorTests(unittest.TestCase):
 
             job = store.get_job("BILL-1")
             self.assertEqual(first, "queued")
-            self.assertEqual(second, "failed")
-            self.assertEqual(job["state"], "failed")
+            self.assertEqual(second, "backlog")
+            self.assertEqual(job["state"], "backlog")
             self.assertEqual(job["attempt_count"], 2)
             self.assertEqual(transitions, ["BILL-1"])
 
@@ -1591,6 +1592,174 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertEqual(job["batch_id"], batch["batch_id"])
             self.assertEqual(job["conflict_group"], "ui")
             self.assertEqual(json.loads(job["dependencies_json"]), ["BILL-1"])
+
+    def test_dependency_gate_blocks_dependent_and_keeps_independent_runnable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = str(Path(tmpdir) / "repo")
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            for issue in ("BILL-1", "BILL-2", "BILL-3"):
+                store.enqueue_issue(
+                    project_key="BILL",
+                    repo_path=repo,
+                    issue_key=issue,
+                    status="To Do",
+                    summary=issue,
+                )
+            store.update_job("BILL-1", state="gate_failed", gate_state="validation_failure")
+            store.update_job(
+                "BILL-2",
+                batch_id="batch-1",
+                dependencies_json=json.dumps(["BILL-1"]),
+            )
+            store.update_job("BILL-3", batch_id="batch-1")
+
+            dependent = store.get_job("BILL-2")
+            status = orchestrator.dependency_status(store, dependent)
+            self.assertFalse(status["satisfied"])
+            self.assertEqual(status["blocked"][0]["issue_key"], "BILL-1")
+
+            settings = SimpleNamespace(
+                max_parallel_per_repo=3,
+                max_parallel_per_project=3,
+            )
+            service = orchestrator.OrchestratorService(settings=settings, store=store)
+            original_refresh = service.refresh_issue_report
+            original_process = service.process_job
+            try:
+                service.refresh_issue_report = lambda *_args, **_kwargs: None
+                service.process_job = lambda issue_key: store.release_lease(repo, issue_key)
+                service.dispatch_jobs()
+                for thread in list(service.active_threads.values()):
+                    thread.join(timeout=1)
+                service.collect_finished_threads()
+            finally:
+                service.refresh_issue_report = original_refresh
+                service.process_job = original_process
+
+            self.assertEqual(store.get_job("BILL-2")["state"], "waiting_dependency")
+            self.assertTrue(store.acquire_lease(repo, "BILL-3", project_key="BILL", max_parallel_per_repo=3, max_parallel_per_project=3))
+
+    def test_dependency_waiting_job_recovers_when_dependency_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = str(Path(tmpdir) / "repo")
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.enqueue_issue(project_key="BILL", repo_path=repo, issue_key="BILL-1", status="To Do", summary="dep")
+            store.enqueue_issue(project_key="BILL", repo_path=repo, issue_key="BILL-2", status="To Do", summary="child")
+            store.update_job("BILL-1", state="done")
+            store.update_job(
+                "BILL-2",
+                state="waiting_dependency",
+                batch_id="batch-1",
+                dependencies_json=json.dumps(["BILL-1"]),
+                blocked_dependencies_json=json.dumps([{"issue_key": "BILL-1", "state": "gate_failed"}]),
+            )
+
+            settings = SimpleNamespace(max_parallel_per_repo=1, max_parallel_per_project=1)
+            service = orchestrator.OrchestratorService(settings=settings, store=store)
+            original_process = service.process_job
+            try:
+                service.process_job = lambda _issue_key: None
+                service.dispatch_jobs()
+                for thread in list(service.active_threads.values()):
+                    thread.join(timeout=1)
+            finally:
+                service.process_job = original_process
+                service.collect_finished_threads()
+
+            self.assertEqual(store.get_job("BILL-2")["state"], "queued")
+            self.assertEqual(store.get_job("BILL-2")["blocked_dependencies_json"], "[]")
+
+    def test_poll_github_jobs_classifies_check_failure_as_gate_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.enqueue_issue(project_key="BILL", repo_path=str(repo), issue_key="BILL-1", status="To Do", summary="check")
+            store.update_job(
+                "BILL-1",
+                state="waiting_checks",
+                branch="codex/BILL-1",
+                worktree_path=str(repo),
+                pr_number="1",
+            )
+            settings = SimpleNamespace(
+                codex_review_authors=("codex",),
+                auto_review_grace_seconds=999,
+                fallback_review_grace_seconds=999,
+                github_merge_policy="manual",
+            )
+            service = orchestrator.OrchestratorService(settings=settings, store=store)
+            original_status = orchestrator.github_pull_request_status
+            original_upsert = orchestrator.upsert_summary_comment
+            try:
+                orchestrator.github_pull_request_status = lambda *_args, **_kwargs: {
+                    "number": 1,
+                    "url": "https://github.example/pull/1",
+                    "state": "OPEN",
+                    "headRefOid": "abc",
+                    "reviews": [],
+                    "comments": [],
+                    "statusCheckRollup": [{"name": "ci", "conclusion": "FAILURE"}],
+                }
+                orchestrator.upsert_summary_comment = lambda *_args, **_kwargs: "comment-1"
+                service.poll_github_jobs(issue_key="BILL-1")
+            finally:
+                orchestrator.github_pull_request_status = original_status
+                orchestrator.upsert_summary_comment = original_upsert
+
+            job = store.get_job("BILL-1")
+            self.assertEqual(job["state"], "gate_failed")
+            self.assertEqual(job["gate_state"], "validation_failure")
+            self.assertIn("ci", job["gate_reason"])
+
+    def test_review_changes_requested_becomes_human_gate(self) -> None:
+        service = orchestrator.OrchestratorService(settings=SimpleNamespace(fallback_review_grace_seconds=999), store=SimpleNamespace())
+        state, updates = service.resolve_review_state(
+            job={},
+            worktree_path=Path("/tmp"),
+            pr={"url": "https://github.example/pull/1"},
+            review_summary={
+                "reviewed": True,
+                "approved": False,
+                "changes_requested": True,
+                "summary": "Codex reviews: changes_requested",
+            },
+            codex_review_mode="auto_required",
+        )
+
+        self.assertEqual(state, "gate_waiting_human")
+        self.assertEqual(updates["gate_state"], "review_changes_requested")
+
+    def test_gate_unblock_requeues_quarantined_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = str(Path(tmpdir) / "repo")
+            store = orchestrator.OrchestratorStore(Path(tmpdir) / "orchestrator.db")
+            store.enqueue_issue(project_key="BILL", repo_path=repo, issue_key="BILL-1", status="To Do", summary="gate")
+            store.update_job(
+                "BILL-1",
+                state="gate_waiting_human",
+                gate_state="review_changes_requested",
+                gate_reason="needs human",
+                blocked_dependencies_json=json.dumps([{"issue_key": "BILL-0", "state": "gate_failed"}]),
+            )
+
+            orchestrator.unblock_gate_issue(store, "BILL-1", reason="fixed")
+
+            job = store.get_job("BILL-1")
+            self.assertEqual(job["state"], "queued")
+            self.assertEqual(job["gate_state"], "")
+            self.assertEqual(job["blocked_dependencies_json"], "[]")
+
+    def test_batch_effective_state_degraded(self) -> None:
+        state = orchestrator.batch_effective_state(
+            {"state": "running"},
+            [{"state": "done"}, {"state": "gate_failed"}, {"state": "queued"}],
+        )
+
+        self.assertEqual(state, "degraded")
+
+    def test_parse_control_command_accepts_unblock(self) -> None:
+        self.assertEqual(orchestrator.parse_control_command("/ai unblock"), "unblock")
 
     def _git(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

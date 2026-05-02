@@ -71,6 +71,12 @@ The worker flow is:
 2. wait for GitHub checks
 3. wait for automatic Codex review
 4. if no review arrives, post `@codex review`
-5. if no Codex review artifact arrives after the fallback grace period, mark the Jira job `blocked`
+5. if no Codex review artifact arrives after the fallback grace period, mark the Jira job `gate_waiting_human` so other independent work can continue
 
 This prevents a request-only comment from being mistaken for a completed review.
+
+After enabling the repo in Codex settings, requeue only the affected issue:
+
+```bash
+./bin/platform orchestrator gate unblock --issue PROJ-123 --reason "Codex review enabled"
+```

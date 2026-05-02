@@ -337,6 +337,48 @@ class PlatformCliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn("/tmp/codex", output.getvalue())
+        self.assertIn("external_agent_session_import_available", output.getvalue())
+
+    def test_codex_external_agent_session_import_version_gate(self) -> None:
+        self.assertFalse(
+            platform.codex_external_agent_session_import_available(
+                {"version": "codex-cli 0.125.0"}
+            )
+        )
+        self.assertTrue(
+            platform.codex_external_agent_session_import_available(
+                {"version": "codex-cli 0.128.0"}
+            )
+        )
+
+    def test_external_agent_session_metadata_matches_repo_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "repo"
+            target.mkdir()
+            session = Path(tmpdir) / "session.jsonl"
+            session.write_text(
+                json.dumps({"cwd": str(target), "customTitle": "implement task"}) + "\n",
+                encoding="utf-8",
+            )
+
+            metadata = platform.external_agent_session_metadata(session, target.resolve())
+
+            self.assertEqual(metadata["cwd"], str(target))
+            self.assertEqual(metadata["title"], "implement task")
+
+    def test_workflow_gate_trigger_warns_when_merge_group_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir)
+            workflow_dir = target / ".github" / "workflows"
+            workflow_dir.mkdir(parents=True)
+            (workflow_dir / "ci.yml").write_text(
+                "name: ci\non:\n  pull_request:\n",
+                encoding="utf-8",
+            )
+
+            warnings = platform.check_workflow_gate_triggers(target)
+
+            self.assertTrue(any("merge_group" in warning for warning in warnings))
 
     def test_orchestrator_registration_missing_warns(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

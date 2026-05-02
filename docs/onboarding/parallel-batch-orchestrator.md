@@ -1,10 +1,10 @@
 # Parallel Batch Orchestrator
 
-v0.2.0 の標準は、Claude と Codex を直接フリーフォーム会話させず、orchestrator が structured contract / trace / approval state を管理する方式です。
+v0.2.1 の標準は、Claude と Codex を直接フリーフォーム会話させず、orchestrator が structured contract / trace / approval state を管理する方式です。
 
 ## Why
 
-直接会話は文脈の漂流、監査欠落、無限往復、権限境界の曖昧化が起きやすいです。v0.2.0 は mediated baton に固定します。
+直接会話は文脈の漂流、監査欠落、無限往復、権限境界の曖昧化が起きやすいです。v0.2.1 は mediated baton に固定します。
 
 1. Claude coordinator が `task_contract` を作る
 2. Codex worker が編集前に `task_understanding` を返す
@@ -60,9 +60,30 @@ Codex worker は `1 issue = 1 worktree = 1 branch = 1 PR` を守ります。
 
 一時的な DNS / timeout / 429 / 5xx は bounded retry します。上限を超えた場合、validation failure、contract 不整合、Codex が理解段階で編集した場合は terminal failure として扱います。
 
+Quality gate failure は terminal failure と同じ扱いにしません。required checks / Codex review / spec-gate / risk gate で止まった issue は、その issue だけを隔離し、batch は `degraded` として継続します。
+
+- `gate_waiting_human`: intentional gate、risk approval、changes requested、manual approval 待ち
+- `gate_failed`: required check、spec-gate、security-scan、merge queue removal
+- `waiting_dependency`: 依存先が gate / failed / backlog のため待機。並列枠は消費しない
+- `backlog`: operator が fail/backlog し、Jira を `To Do` / `Backlog` 相当に戻した terminal state
+
+Gate 状態の確認と解除:
+
+```bash
+./bin/platform orchestrator gate status --batch PROJ-YYYYMMDDHHMMSS
+./bin/platform orchestrator gate status --project PROJ
+./bin/platform orchestrator gate unblock --issue PROJ-123 --reason "required check fixed"
+```
+
+Jira comment でも明示解除できます。
+
+```text
+/ai unblock
+```
+
 Terminal failure の処理:
 
-- job state を `failed` にする
+- job state を `failed` にする。operator が `--backlog` を指定した場合は `backlog` まで進める
 - Jira sticky comment に原因、attempt、再実行コマンドを書く
 - Jira status を `To Do` / `Backlog` 相当に best-effort transition する
 - lease を解放し、scheduler は次の executable issue へ進む
@@ -84,7 +105,7 @@ Terminal failure の処理:
 
 ## Merge Policy
 
-GitHub が最終統制面です。v0.2.0 の既定は `github.merge_policy = "merge_queue"` です。
+GitHub が最終統制面です。v0.2.1 の既定は `github.merge_policy = "merge_queue"` です。
 
 Worker は PR が `ready_for_merge` になった後、`gh pr merge --auto --merge` で GitHub auto-merge / merge queue を有効化します。branch protection、required checks、merge queue の実際の判定は GitHub 側に委ねます。
 

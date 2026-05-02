@@ -76,22 +76,24 @@ CONTROL_LABEL = "ai:control"
 WORKTREE_ROOTNAME = "worktrees"
 ISSUE_RE = re.compile(r"[A-Z][A-Z0-9]+-\d+")
 CONTROL_COMMAND_RE = re.compile(
-    r"^/ai\s+(pause|resume|cancel|retry|status|pause-project|resume-project|drain-project)\s*$",
+    r"^/ai\s+(pause|resume|cancel|retry|status|unblock|pause-project|resume-project|drain-project)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 EVENT_PATH_RE = re.compile(r"^/jira/events/(?P<project_key>[A-Za-z][A-Za-z0-9]+)$")
-RUNNABLE_STATES = {
-    "queued",
-    "planning",
-    "coding",
-    "reviewing",
-    "pr_open",
-    "paused",
+RUNNABLE_STATES = {"queued", "planning", "coding", "reviewing", "pr_open", "paused", "blocked", "failed"}
+GATE_STATES = {"gate_waiting_human", "gate_failed"}
+DEPENDENCY_WAIT_STATES = {"waiting_dependency"}
+DEPENDENCY_BLOCKING_STATES = {
+    "gate_failed",
+    "gate_waiting_human",
     "blocked",
     "failed",
+    "backlog",
+    "cancelled",
 }
-WAITING_STATES = {"waiting_checks", "waiting_review", "ready_for_merge"}
-TERMINAL_STATES = {"ready_for_merge", "done", "cancelled"}
+WAITING_STATES = {"waiting_checks", "waiting_review", "ready_for_merge", *GATE_STATES, *DEPENDENCY_WAIT_STATES}
+GITHUB_POLL_STATES = {"waiting_checks", "waiting_review", "ready_for_merge", *GATE_STATES}
+TERMINAL_STATES = {"ready_for_merge", "done", "cancelled", "backlog"}
 ACTIVE_JIRA_TRANSITION_STATES = {
     "queued",
     "planning",
@@ -119,7 +121,7 @@ CODEX_CLI_INCOMPATIBLE_PATTERNS = (
 )
 TRANSIENT_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 DEFAULT_API_RETRY_ATTEMPTS = 3
-PLATFORM_RELEASE_VERSION = "v0.2.0"
+PLATFORM_RELEASE_VERSION = "v0.2.1"
 
 
 class OrchestratorError(RuntimeError):
@@ -450,6 +452,23 @@ def register_commands(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     fail.add_argument("--reason", default="operator marked failed", help="Failure reason.")
     fail.add_argument("--backlog", action="store_true", help="Best-effort transition back to To Do / Backlog.")
     fail.set_defaults(func=cmd_fail)
+
+    gate = orchestrator_subparsers.add_parser(
+        "gate",
+        help="Inspect and unblock issue-level quality gates without stopping the whole batch.",
+    )
+    gate_subparsers = gate.add_subparsers(dest="gate_command", required=True)
+    gate_status = gate_subparsers.add_parser("status", help="Show gate/quarantine state.")
+    gate_status.add_argument("--config", default=None, help="Override the worker config path.")
+    gate_status.add_argument("--issue", default=None, help="Filter by Jira issue key.")
+    gate_status.add_argument("--batch", default=None, help="Filter by batch id.")
+    gate_status.add_argument("--project", default=None, help="Filter by Jira project key.")
+    gate_status.set_defaults(func=cmd_gate_status)
+    gate_unblock = gate_subparsers.add_parser("unblock", help="Requeue an issue after a human gate is resolved.")
+    gate_unblock.add_argument("--config", default=None, help="Override the worker config path.")
+    gate_unblock.add_argument("--issue", required=True, help="Issue key to unblock.")
+    gate_unblock.add_argument("--reason", required=True, help="Human-readable unblock reason.")
+    gate_unblock.set_defaults(func=cmd_gate_unblock)
 
     batch = orchestrator_subparsers.add_parser(
         "batch",
@@ -825,6 +844,37 @@ def cmd_fail(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gate_status(args: argparse.Namespace) -> int:
+    settings = load_worker_settings(config_override=args.config)
+    store = OrchestratorStore(settings.db_path)
+    if args.batch:
+        rows = store.list_jobs_for_batch(args.batch)
+    else:
+        rows = store.list_jobs(
+            issue_key=args.issue.upper() if args.issue else None,
+            project_key=args.project.upper() if args.project else None,
+        )
+    payload = {
+        "gates": [gate_status_row(row) for row in rows],
+        "batches": store.list_batches(batch_id=args.batch) if args.batch else [],
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_gate_unblock(args: argparse.Namespace) -> int:
+    settings = load_worker_settings(config_override=args.config)
+    store = OrchestratorStore(settings.db_path)
+    issue_key = args.issue.upper()
+    unblock_gate_issue(store, issue_key, reason=args.reason)
+    OrchestratorService(settings=settings, store=store).refresh_issue_report(
+        issue_key,
+        extra_notice=f"Gate unblocked: {args.reason}",
+    )
+    print(f"Gate unblocked and queued for {issue_key}")
+    return 0
+
+
 def cmd_batch_create(args: argparse.Namespace) -> int:
     settings = load_worker_settings(config_override=args.config)
     require_runtime_credentials(settings)
@@ -954,8 +1004,11 @@ def retry_issue_job(store: "OrchestratorStore", issue_key: str, *, reason: str) 
     job = store.get_job(issue_key)
     if not job:
         raise OrchestratorError(f"Job not found: {issue_key}")
-    if str(job.get("state", "")) not in {"failed", "blocked"}:
-        raise OrchestratorError(f"Job {issue_key} is `{job.get('state')}`; retry is only allowed for failed/blocked jobs.")
+    retryable_states = {"failed", "blocked", "gate_failed", "gate_waiting_human", "waiting_dependency", "backlog"}
+    if str(job.get("state", "")) not in retryable_states:
+        raise OrchestratorError(
+            f"Job {issue_key} is `{job.get('state')}`; retry is only allowed for {', '.join(sorted(retryable_states))} jobs."
+        )
     signal_active_process(job.get("active_pid"))
     store.release_lease(str(job.get("repo_path", "")), issue_key)
     store.update_job(
@@ -964,6 +1017,9 @@ def retry_issue_job(store: "OrchestratorStore", issue_key: str, *, reason: str) 
         latest_error="",
         requested_action="",
         active_pid=None,
+        gate_state="",
+        gate_reason="",
+        blocked_dependencies_json="[]",
     )
     store.record_step(
         issue_key,
@@ -991,13 +1047,17 @@ def fail_issue_job(
     signal_active_process(job.get("active_pid"))
     store.release_lease(str(job.get("repo_path", "")), issue_key)
     attempt_count = int(job.get("attempt_count") or 0) + 1
+    final_state = "backlog" if backlog else "failed"
     store.update_job(
         issue_key,
-        state="failed",
+        state=final_state,
         latest_error=reason,
         active_pid=None,
         requested_action="",
         attempt_count=attempt_count,
+        gate_state="",
+        gate_reason="",
+        blocked_dependencies_json="[]",
     )
     payload = {
         "summary": reason,
@@ -1014,12 +1074,12 @@ def fail_issue_job(
         payload["backlog_transition"] = transition
         if transition.get("status_name"):
             store.update_job(issue_key, status_name=str(transition["status_name"]))
-    store.record_step(issue_key, "failed", "failed", payload)
+    store.record_step(issue_key, final_state, "failed", payload)
     store.record_attempt(
         issue_key,
         batch_id=str(job.get("batch_id", "")),
         attempt=attempt_count,
-        step_name="failed",
+        step_name=final_state,
         status="failed",
         classification=classify_failure_reason(reason),
         payload=payload,
@@ -1070,7 +1130,7 @@ def retry_transient_or_fail_issue_job(
         )
         return "queued"
     fail_issue_job(store, settings, issue_key, reason=reason, backlog=backlog)
-    return "failed"
+    return "backlog" if backlog else "failed"
 
 
 def classify_failure_reason(reason: str) -> str:
@@ -1085,12 +1145,133 @@ def classify_failure_reason(reason: str) -> str:
 
 
 def dependencies_satisfied(store: "OrchestratorStore", job: dict[str, Any]) -> bool:
+    return dependency_status(store, job)["satisfied"]
+
+
+def dependency_status(store: "OrchestratorStore", job: dict[str, Any]) -> dict[str, Any]:
     dependencies = parse_dependencies(job.get("dependencies_json"))
+    blocked: list[dict[str, str]] = []
+    waiting: list[dict[str, str]] = []
     for dependency in dependencies:
         dep_job = store.get_job(dependency)
-        if not dep_job or dep_job.get("state") != "done":
-            return False
-    return True
+        state = str(dep_job.get("state", "")) if dep_job else "missing"
+        if state == "done":
+            continue
+        item = {"issue_key": dependency, "state": state}
+        if state in DEPENDENCY_BLOCKING_STATES:
+            blocked.append(item)
+        else:
+            waiting.append(item)
+    return {
+        "dependencies": dependencies,
+        "satisfied": not blocked and not waiting,
+        "blocked": blocked,
+        "waiting": waiting,
+    }
+
+
+def batch_effective_state(batch: dict[str, Any], jobs: list[dict[str, Any]]) -> str:
+    explicit = str(batch.get("state", ""))
+    if explicit in {"paused", "cancelled"}:
+        return explicit
+    if not jobs:
+        return explicit or "running"
+    states = {str(job.get("state", "")) for job in jobs}
+    if states and states <= {"done"}:
+        return "done"
+    degraded_states = {
+        "gate_failed",
+        "gate_waiting_human",
+        "waiting_dependency",
+        "blocked",
+        "failed",
+        "backlog",
+        "cancelled",
+    }
+    if states & degraded_states:
+        return "degraded"
+    return explicit or "running"
+
+
+def gate_status_row(job: dict[str, Any]) -> dict[str, Any]:
+    blocked_dependencies = parse_blocked_dependencies(job.get("blocked_dependencies_json"))
+    return {
+        "issue_key": job.get("issue_key", ""),
+        "project_key": job.get("project_key", ""),
+        "batch_id": job.get("batch_id", ""),
+        "state": job.get("state", ""),
+        "gate_state": job.get("gate_state", "") or inferred_gate_state(job),
+        "gate_reason": job.get("gate_reason", "") or job.get("latest_error", ""),
+        "blocked_dependencies": blocked_dependencies,
+        "pr_url": job.get("pr_url", ""),
+        "next_operator_action": next_operator_action(job, blocked_dependencies),
+    }
+
+
+def inferred_gate_state(job: dict[str, Any]) -> str:
+    state = str(job.get("state", ""))
+    if state in GATE_STATES or state in DEPENDENCY_WAIT_STATES:
+        return state
+    return ""
+
+
+def parse_blocked_dependencies(value: Any) -> list[dict[str, str]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if not value:
+        return []
+    try:
+        decoded = json.loads(str(value))
+    except json.JSONDecodeError:
+        return []
+    return [item for item in decoded if isinstance(item, dict)] if isinstance(decoded, list) else []
+
+
+def next_operator_action(job: dict[str, Any], blocked_dependencies: list[dict[str, str]] | None = None) -> str:
+    state = str(job.get("state", ""))
+    issue_key = str(job.get("issue_key", ""))
+    if state == "gate_waiting_human":
+        return f"Resolve the human gate, then run `platform orchestrator gate unblock --issue {issue_key} --reason <reason>` or comment `/ai unblock`."
+    if state == "gate_failed":
+        return f"Fix the failing gate, then run `platform orchestrator gate unblock --issue {issue_key} --reason <reason>` or `platform orchestrator fail --issue {issue_key} --backlog`."
+    if state == "waiting_dependency":
+        deps = ", ".join(str(item.get("issue_key", "")) for item in (blocked_dependencies or []) if item.get("issue_key"))
+        return f"Waiting for dependency resolution: {deps or 'dependency not done'}."
+    if state in {"failed", "blocked", "backlog"}:
+        return f"Run `platform orchestrator retry --issue {issue_key}` after fixing the blocker."
+    return "none"
+
+
+def unblock_gate_issue(store: "OrchestratorStore", issue_key: str, *, reason: str) -> None:
+    job = store.get_job(issue_key)
+    if not job:
+        raise OrchestratorError(f"Job not found: {issue_key}")
+    state = str(job.get("state", ""))
+    allowed = {*GATE_STATES, *DEPENDENCY_WAIT_STATES, "blocked", "failed"}
+    if state not in allowed:
+        raise OrchestratorError(f"Job {issue_key} is `{state}`; gate unblock is only allowed for quarantined jobs.")
+    signal_active_process(job.get("active_pid"))
+    store.release_lease(str(job.get("repo_path", "")), issue_key)
+    store.update_job(
+        issue_key,
+        state="queued",
+        latest_error="",
+        requested_action="",
+        active_pid=None,
+        gate_state="",
+        gate_reason="",
+        blocked_dependencies_json="[]",
+    )
+    store.record_step(
+        issue_key,
+        "gate_unblock",
+        "success",
+        {
+            "summary": f"Gate unblocked: {reason}",
+            "reason": reason,
+            "previous_state": state,
+        },
+    )
 
 
 def parse_dependencies(value: Any) -> list[str]:
@@ -1285,8 +1466,13 @@ class OrchestratorService:
             signal_active_process(self.store.get_job(issue_key).get("active_pid"))
         elif command == "retry":
             job = self.store.get_job(issue_key)
-            if job and job["state"] in {"failed", "blocked"}:
+            if job and job["state"] in {"failed", "blocked", "gate_failed", "gate_waiting_human", "waiting_dependency", "backlog"}:
                 retry_issue_job(self.store, issue_key, reason="Jira /ai retry")
+        elif command == "unblock":
+            job = self.store.get_job(issue_key)
+            if job and job["state"] in {"gate_failed", "gate_waiting_human", "waiting_dependency", "blocked"}:
+                unblock_gate_issue(self.store, issue_key, reason="Jira /ai unblock")
+                self.refresh_issue_report(issue_key, extra_notice="Gate unblocked from Jira comment.")
         elif command == "status":
             self.refresh_issue_report(issue_key)
 
@@ -1385,8 +1571,33 @@ class OrchestratorService:
                 batch = self.store.batch(batch_id)
                 if str(batch.get("state", "")) in {"paused", "cancelled"}:
                     continue
-                if not dependencies_satisfied(self.store, job):
+                dep_status = dependency_status(self.store, job)
+                if not dep_status["satisfied"]:
+                    blocked_dependencies = dep_status["blocked"] or dep_status["waiting"]
+                    if str(job.get("state", "")) != "waiting_dependency" or parse_blocked_dependencies(job.get("blocked_dependencies_json")) != blocked_dependencies:
+                        self.store.update_job(
+                            issue_key,
+                            state="waiting_dependency",
+                            gate_state="waiting_dependency",
+                            gate_reason="Waiting for dependency issue(s) before this work can start.",
+                            blocked_dependencies_json=json.dumps(blocked_dependencies, ensure_ascii=False),
+                        )
+                        with contextlib.suppress(Exception):
+                            self.refresh_issue_report(issue_key)
                     continue
+                if str(job.get("state", "")) == "waiting_dependency":
+                    self.store.update_job(
+                        issue_key,
+                        state="queued",
+                        gate_state="",
+                        gate_reason="",
+                        blocked_dependencies_json="[]",
+                    )
+                    job = self.store.get_job(issue_key)
+                if str(job.get("state", "")) != "queued":
+                    continue
+            if str(job.get("state", "")) != "queued":
+                continue
             with self.thread_lock:
                 if issue_key in self.active_threads:
                     continue
@@ -1667,19 +1878,39 @@ class OrchestratorService:
             check_summary = summarize_checks(pr.get("statusCheckRollup", []))
             if pr.get("state") == "MERGED":
                 state = "done"
+                updates["latest_error"] = ""
+                updates["gate_state"] = ""
+                updates["gate_reason"] = ""
+                updates["blocked_dependencies_json"] = "[]"
             elif check_summary["failed"]:
-                state = "blocked"
-                updates["latest_error"] = check_summary["summary"]
-            elif state == "waiting_checks" and check_summary["passed"]:
+                gate = classify_gate_result(
+                    check_summary=check_summary,
+                    review_summary=review_summary,
+                    pr=pr,
+                )
+                state = gate["state"]
+                updates["latest_error"] = gate["reason"]
+                updates["gate_state"] = gate["classification"]
+                updates["gate_reason"] = gate["reason"]
+                updates["blocked_dependencies_json"] = "[]"
+            elif (
+                state in {"waiting_checks", "gate_failed", "gate_waiting_human"}
+                and check_summary["passed"]
+                and str(job.get("gate_state", "")) != "review_changes_requested"
+            ):
                 state = "waiting_review"
                 updates["review_requested_at"] = str(job.get("review_requested_at") or now_iso())
+                updates["latest_error"] = ""
+                updates["gate_state"] = ""
+                updates["gate_reason"] = ""
+                updates["blocked_dependencies_json"] = "[]"
                 if codex_review_mode == "comment_fallback":
                     updates["review_fallback_requested_at"] = request_codex_review(
                         worktree_path,
                         pr["url"],
                         existing_timestamp=str(job.get("review_fallback_requested_at", "")),
                     )
-            if state == "waiting_review":
+            if state in {"waiting_review", "gate_waiting_human"}:
                 job_snapshot = {**job, **updates}
                 state, extra_updates = self.resolve_review_state(
                     job=job_snapshot,
@@ -1689,7 +1920,7 @@ class OrchestratorService:
                     codex_review_mode=codex_review_mode,
                 )
                 updates.update(extra_updates)
-                if state == "blocked" and "Codex review did not arrive" in str(updates.get("latest_error", "")):
+                if state == "gate_waiting_human" and "Codex review did not arrive" in str(updates.get("latest_error", "")):
                     fresh_pr = github_pull_request_status(worktree_path, job["branch"], str(updates.get("pr_number", "")))
                     if fresh_pr:
                         fresh_review_summary = summarize_reviews(
@@ -1702,9 +1933,18 @@ class OrchestratorService:
                             review_summary = fresh_review_summary
                             state = "ready_for_merge"
                             updates.pop("latest_error", None)
+                            updates["latest_error"] = ""
+                            updates["gate_state"] = ""
+                            updates["gate_reason"] = ""
+                            updates["blocked_dependencies_json"] = "[]"
                             updates["pr_url"] = pr["url"]
                             updates["pr_number"] = str(pr["number"])
                             updates["latest_commit"] = pr.get("headRefOid", updates.get("latest_commit", ""))
+            if state == "ready_for_merge":
+                updates["latest_error"] = ""
+                updates["gate_state"] = ""
+                updates["gate_reason"] = ""
+                updates["blocked_dependencies_json"] = "[]"
             if state == "ready_for_merge" and getattr(self.settings, "github_merge_policy", DEFAULT_GITHUB_MERGE_POLICY) == "merge_queue":
                 merge_result = ensure_github_auto_merge(worktree_path, pr.get("url", ""))
                 if merge_result.get("warning"):
@@ -1732,12 +1972,26 @@ class OrchestratorService:
     ) -> tuple[str, dict[str, Any]]:
         updates: dict[str, Any] = {}
         if review_summary["changes_requested"]:
+            gate = classify_gate_result(review_summary=review_summary)
             return (
-                "blocked",
-                {"latest_error": review_summary["summary"]},
+                gate["state"],
+                {
+                    "latest_error": gate["reason"],
+                    "gate_state": gate["classification"],
+                    "gate_reason": gate["reason"],
+                },
             )
         if review_summary["reviewed"]:
-            return ("ready_for_merge", updates)
+            return (
+                "ready_for_merge",
+                {
+                    **updates,
+                    "latest_error": "",
+                    "gate_state": "",
+                    "gate_reason": "",
+                    "blocked_dependencies_json": "[]",
+                },
+            )
 
         now = now_iso()
         review_requested_at = str(job.get("review_requested_at") or now)
@@ -1754,10 +2008,12 @@ class OrchestratorService:
                 updates["review_fallback_requested_at"] = fallback_requested_at
             if fallback_requested_at and seconds_since(fallback_requested_at) >= self.settings.fallback_review_grace_seconds:
                 return (
-                    "blocked",
+                    "gate_waiting_human",
                     {
                         **updates,
                         "latest_error": "Codex review did not arrive after the fallback review request.",
+                        "gate_state": "intentional_gate",
+                        "gate_reason": "Codex review did not arrive after the fallback review request.",
                     },
                 )
             return ("waiting_review", updates)
@@ -1772,10 +2028,12 @@ class OrchestratorService:
                 updates["review_fallback_requested_at"] = fallback_requested_at
         if fallback_requested_at and seconds_since(fallback_requested_at) >= self.settings.fallback_review_grace_seconds:
             return (
-                "blocked",
+                "gate_waiting_human",
                 {
                     **updates,
                     "latest_error": "Codex review did not arrive after the fallback review request.",
+                    "gate_state": "intentional_gate",
+                    "gate_reason": "Codex review did not arrive after the fallback review request.",
                 },
             )
         return ("waiting_review", updates)
@@ -1896,6 +2154,9 @@ class OrchestratorStore:
                     pr_number TEXT DEFAULT '',
                     latest_commit TEXT DEFAULT '',
                     latest_error TEXT DEFAULT '',
+                    gate_state TEXT DEFAULT '',
+                    gate_reason TEXT DEFAULT '',
+                    blocked_dependencies_json TEXT DEFAULT '[]',
                     active_pid INTEGER,
                     requested_action TEXT DEFAULT '',
                     review_requested_at TEXT DEFAULT '',
@@ -2052,6 +2313,9 @@ class OrchestratorStore:
                 ("dependencies_json", "TEXT DEFAULT '[]'"),
                 ("attempt_count", "INTEGER DEFAULT 0"),
                 ("contract_rounds", "INTEGER DEFAULT 0"),
+                ("gate_state", "TEXT DEFAULT ''"),
+                ("gate_reason", "TEXT DEFAULT ''"),
+                ("blocked_dependencies_json", "TEXT DEFAULT '[]'"),
             ):
                 self._ensure_column(connection, "jobs", name, definition)
 
@@ -2247,6 +2511,7 @@ class OrchestratorStore:
             batches = [dict(row) for row in connection.execute(query, params).fetchall()]
         for batch in batches:
             batch["jobs"] = self.list_jobs_for_batch(str(batch["batch_id"]))
+            batch["effective_state"] = batch_effective_state(batch, batch["jobs"])
         return batches
 
     def upsert_work_unit(
@@ -2460,7 +2725,7 @@ class OrchestratorStore:
             rows = connection.execute(
                 """
                 SELECT * FROM jobs
-                WHERE state = 'queued'
+                WHERE state IN ('queued', 'waiting_dependency')
                 ORDER BY created_at ASC
                 """
             ).fetchall()
@@ -2469,8 +2734,9 @@ class OrchestratorStore:
     def list_waiting_jobs(
         self, *, issue_key: str | None = None, project_key: str | None = None
     ) -> list[dict[str, Any]]:
-        clauses = ["state IN ('waiting_checks', 'waiting_review', 'ready_for_merge')"]
-        params: list[Any] = []
+        placeholders = ", ".join("?" for _ in GITHUB_POLL_STATES)
+        clauses = [f"state IN ({placeholders})"]
+        params: list[Any] = sorted(GITHUB_POLL_STATES)
         if issue_key:
             clauses.append("issue_key = ?")
             params.append(issue_key)
@@ -5035,18 +5301,79 @@ def is_codex_review_comment(comment: dict[str, Any], authors: set[str]) -> bool:
 
 def summarize_checks(items: list[dict[str, Any]]) -> dict[str, Any]:
     if not items:
-        return {"passed": False, "failed": False, "summary": "Checks have not reported yet."}
+        return {"passed": False, "failed": False, "summary": "Checks have not reported yet.", "failed_items": []}
     conclusions: list[str] = []
+    failed_items: list[str] = []
     for item in items:
         conclusion = str(item.get("conclusion") or item.get("state") or "").lower()
         if conclusion:
             conclusions.append(conclusion)
+        if conclusion in {"failure", "timed_out", "cancelled", "startup_failure"}:
+            name = str(item.get("name") or item.get("context") or item.get("workflowName") or item.get("__typename") or "unknown")
+            failed_items.append(name)
     failed = any(value in {"failure", "timed_out", "cancelled", "startup_failure"} for value in conclusions)
     passed = all(value in {"success", "neutral", "skipped"} for value in conclusions) and bool(conclusions)
     return {
         "passed": passed,
         "failed": failed,
-        "summary": f"Checks: {', '.join(conclusions) if conclusions else 'pending'}",
+        "failed_items": failed_items,
+        "summary": f"Checks: {', '.join(conclusions) if conclusions else 'pending'}"
+        + (f" | failed: {', '.join(failed_items)}" if failed_items else ""),
+    }
+
+
+def classify_gate_result(
+    *,
+    check_summary: dict[str, Any] | None = None,
+    review_summary: dict[str, Any] | None = None,
+    pr: dict[str, Any] | None = None,
+    latest_error: str = "",
+) -> dict[str, str]:
+    check_summary = check_summary or {}
+    review_summary = review_summary or {}
+    text = " ".join(
+        [
+            str(check_summary.get("summary", "")),
+            " ".join(str(item) for item in check_summary.get("failed_items", []) or []),
+            str(review_summary.get("summary", "")),
+            str((pr or {}).get("mergeStateStatus", "")),
+            latest_error,
+        ]
+    ).lower()
+    if "changes_requested" in text or "changes requested" in text or review_summary.get("changes_requested"):
+        return {
+            "classification": "review_changes_requested",
+            "state": "gate_waiting_human",
+            "reason": str(review_summary.get("summary") or "Codex review requested changes."),
+        }
+    if any(fragment in text for fragment in ("manual", "approval", "risk", "ai-gate", "release-ready")):
+        return {
+            "classification": "intentional_gate",
+            "state": "gate_waiting_human",
+            "reason": str(check_summary.get("summary") or latest_error or "Intentional quality gate is waiting for human approval."),
+        }
+    if any(fragment in text for fragment in ("security", "secret", "vulnerability", "dependency-review")):
+        return {
+            "classification": "security_failure",
+            "state": "gate_failed",
+            "reason": str(check_summary.get("summary") or latest_error or "Security gate failed."),
+        }
+    if any(fragment in text for fragment in ("merge queue", "merge_group", "removed from merge")):
+        return {
+            "classification": "merge_queue_removed",
+            "state": "gate_failed",
+            "reason": latest_error or "PR was removed from merge queue or merge_group validation failed.",
+        }
+    if check_summary.get("failed"):
+        return {
+            "classification": "validation_failure",
+            "state": "gate_failed",
+            "reason": str(check_summary.get("summary") or latest_error or "Required check failed."),
+        }
+    return {
+        "classification": "unknown",
+        "state": "blocked",
+        "reason": latest_error or "Unknown gate result.",
     }
 
 
@@ -5058,9 +5385,16 @@ def build_summary_comment(
     fallback_summary: str,
     extra_notice: str,
 ) -> str:
+    blocked_dependencies = parse_blocked_dependencies(job.get("blocked_dependencies_json"))
+    gate_state = job.get("gate_state") or inferred_gate_state(job) or "none"
+    gate_reason = job.get("gate_reason") or ("; ".join(f"{item.get('issue_key')}={item.get('state')}" for item in blocked_dependencies) if blocked_dependencies else "")
     body = [
         SUMMARY_MARKER,
         f"- state: `{job['state']}`",
+        f"- gate_state: `{gate_state}`",
+        f"- gate_reason: {gate_reason or 'none'}",
+        f"- blocked_dependencies: {', '.join(item.get('issue_key', '') for item in blocked_dependencies if item.get('issue_key')) or 'none'}",
+        f"- next_operator_action: {next_operator_action(job, blocked_dependencies)}",
         f"- branch: `{job.get('branch') or 'n/a'}`",
         f"- latest commit: `{job.get('latest_commit') or 'n/a'}`",
         f"- PR URL: {job.get('pr_url') or 'n/a'}",

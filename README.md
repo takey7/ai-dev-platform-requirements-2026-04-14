@@ -93,7 +93,7 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
   --issue-project-key PROJ \
   --confluence-space SPACE \
   --source-repo takey7/ai-dev-platform-requirements-2026-04-14 \
-  --version v0.2.0
+  --version v0.2.1
 ```
 
 `bootstrap` is the canonical platform primitive. `create-project` is a convenience workflow that orchestrates repo creation and then applies the same baseline.
@@ -140,7 +140,7 @@ export ATLASSIAN_API_TOKEN=<jira-admin-token>
 - worker は single-process + SQLite WAL で state を保持する
 - repo ごとに最大 3 issue を並列実行する。ただし同じ conflict group / protected path / dependency は同時実行しない
 - `ai:auto` + ready status (`To Do`, `Selected for Development`) の issue を対象にする
-- Jira comments を polling し、`/ai pause`, `/ai resume`, `/ai cancel`, `/ai retry`, `/ai status` を処理する
+- Jira comments を polling し、`/ai pause`, `/ai resume`, `/ai cancel`, `/ai retry`, `/ai unblock`, `/ai status` を処理する
 - Claude planning -> Codex understanding -> Claude approval -> Codex implementation の mediated baton を通す
 - 作業開始時に Jira を `In Progress` / `進行中` / `作業中` へ best-effort transition する
 - PR merge 後だけ Jira を `Done` / `完了` へ best-effort transition する
@@ -171,6 +171,8 @@ Codex GitHub review の有効化は ChatGPT/Codex settings 側の repo 単位ト
 ./bin/platform orchestrator resume --issue PROJ-123
 ./bin/platform orchestrator cancel --issue PROJ-123
 ./bin/platform orchestrator fail --issue PROJ-123 --backlog --reason "validation failed"
+./bin/platform orchestrator gate status --project PROJ
+./bin/platform orchestrator gate unblock --issue PROJ-123 --reason "review comments addressed"
 ```
 
 `status` without `--refresh` reads the local SQLite state only. If the worker is not running, use `poll` or `status --refresh` to refresh GitHub checks/reviews and Jira reporting.
@@ -180,6 +182,7 @@ Jira 側でも次の comment commands を使えます。
 - `/ai resume`
 - `/ai cancel`
 - `/ai retry`
+- `/ai unblock`
 - `/ai status`
 - project control issue 専用:
   - `/ai pause-project`
@@ -200,6 +203,13 @@ Jira 側でも次の comment commands を使えます。
 ```
 
 Batch planning は Claude coordinator が DAG / dependency / conflict group / task contract を作り、Codex worker は issue 単位で実装します。各 Codex worker は実装前に `task_understanding` を返し、Claude が `approved` を返した場合だけ編集します。
+
+v0.2.1 以降、required checks / Codex review / spec-gate / risk gate で止まった PR は batch 全体を止めず、その issue だけを `gate_failed` または `gate_waiting_human` に隔離します。依存 issue は `waiting_dependency` になり、独立 issue は継続します。
+
+- `gate_waiting_human`: risk approval / changes requested / manual gate 待ち
+- `gate_failed`: required check / spec-gate / security-scan / merge queue failure
+- `waiting_dependency`: 依存先が gate / failed / backlog で止まっているため待機
+- `backlog`: operator が fail/backlog し、Jira を `To Do` / `Backlog` へ戻した状態
 
 ## Recommended tool versions
 - OpenAI / Codex:

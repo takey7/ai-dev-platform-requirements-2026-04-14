@@ -56,7 +56,7 @@ pnpm --version
   --github-owner <GITHUB_OWNER> \
   --projects-root ~/workspaces \
   --source-repo <GITHUB_OWNER>/ai-dev-platform-requirements-2026-04-14 \
-  --source-ref v0.2.0 \
+  --source-ref v0.2.1 \
   --adapter node-ts \
   --launch-mode none \
   --jira-site-url https://<SITE>.atlassian.net \
@@ -192,7 +192,7 @@ gh pr view <PR_NUMBER> --repo <GITHUB_OWNER>/learning-ai-flow-<YYYYMMDD> --json 
 - required checks が success
 - `reviews` に `codex` / `codex[bot]` の review があるか、`comments` に `chatgpt-codex-connector` の `Codex Review:` comment が存在する
 - review が来ない場合、worker は `@codex review` fallback を投稿する
-- fallback 後も Codex review artifact が来なければ Jira に `blocked` として設定不足を書き戻す
+- fallback 後も Codex review artifact が来なければ Jira に `gate_waiting_human` として設定不足を書き戻す
 
 Codex review は CLI から強制有効化できません。repo ごとに GitHub/Codex 側で automatic review を有効化してください。
 
@@ -208,7 +208,7 @@ Codex review は CLI から強制有効化できません。repo ごとに GitHu
 - Jira sticky comment に state / branch / PR URL / checks / review が表示されている
 - `ready_for_merge` では Jira が Done にならない
 - PR merge 後の poll で Jira が Done になる
-- Codex review が来ない場合でも、理由が Jira に `blocked` として返る
+- Codex review が来ない場合でも、理由が Jira に `gate_waiting_human` として返る
 
 ## 12. よくある停止操作
 
@@ -216,6 +216,8 @@ Codex review は CLI から強制有効化できません。repo ごとに GitHu
 ./bin/platform orchestrator pause --issue LEARN-1
 ./bin/platform orchestrator resume --issue LEARN-1
 ./bin/platform orchestrator cancel --issue LEARN-1
+./bin/platform orchestrator gate status --issue LEARN-1
+./bin/platform orchestrator gate unblock --issue LEARN-1 --reason "operator approved"
 ```
 
 Jira comment からも操作できます。
@@ -224,5 +226,6 @@ Jira comment からも操作できます。
 /ai pause
 /ai resume
 /ai cancel
+/ai unblock
 /ai status
 ```

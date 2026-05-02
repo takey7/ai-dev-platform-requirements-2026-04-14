@@ -84,7 +84,7 @@ cd ai-dev-platform-requirements-2026-04-14
   --github-owner <GITHUB_OWNER> \
   --projects-root ~/workspaces \
   --source-repo takey7/ai-dev-platform-requirements-2026-04-14 \
-  --source-ref v0.2.0 \
+  --source-ref v0.2.1 \
   --adapter node-ts \
   --launch-mode none \
   --jira-site-url https://<JIRA_SITE>.atlassian.net \

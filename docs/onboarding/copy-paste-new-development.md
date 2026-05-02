@@ -40,7 +40,7 @@ export PROJECTS_ROOT="$HOME/workspaces"
 
 export GITHUB_OWNER="takey7"
 export PLATFORM_SOURCE_REPO="takey7/ai-dev-platform-requirements-2026-04-14"
-export PLATFORM_VERSION="v0.2.0"
+export PLATFORM_VERSION="v0.2.1"
 
 export JIRA_SITE_URL="https://ssbot.atlassian.net"
 export JIRA_ADMIN_EMAIL="YOUR_ATLASSIAN_ADMIN_EMAIL@example.com"
@@ -407,6 +407,14 @@ cd "$PLATFORM_SOURCE"
 ```
 
 Claude coordinator が dependency / conflict group / task contract を作ります。同じ conflict group や依存関係がある issue は同時に lease されず、独立 issue だけが並列で Codex worker に渡ります。
+
+品質ゲートで 1 issue だけ止まった場合でも batch 全体は止まりません。状態を確認し、必要なら対象 issue だけ解除または backlog に戻します。
+
+```bash
+./bin/platform orchestrator gate status --project "$JIRA_KEY"
+./bin/platform orchestrator gate unblock --issue "$JIRA_KEY-123" --reason "required check fixed"
+./bin/platform orchestrator fail --issue "$JIRA_KEY-123" --backlog --reason "spec gate failed intentionally"
+```
 
 停止・再開:
 

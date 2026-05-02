@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import webbrowser
 from pathlib import Path
 from typing import Any
@@ -22,7 +24,7 @@ if str(SCRIPT_PATH.parent) not in sys.path:
     sys.path.insert(0, str(SCRIPT_PATH.parent))
 import platform_orchestrator
 
-DEFAULT_PLATFORM_VERSION = "0.2.0"
+DEFAULT_PLATFORM_VERSION = "0.2.1"
 DEFAULT_SOURCE_REF = "main"
 DEFAULT_ATLASSIAN_MCP_URL = "https://mcp.atlassian.com/v1/mcp"
 DEFAULT_PROJECTS_ROOT = str((Path.home() / "workspaces").expanduser())
@@ -678,6 +680,8 @@ def cmd_toolchain_doctor(args: argparse.Namespace) -> int:
         write=True,
         require=False,
     )
+    result["external_agent_session_import_available"] = codex_external_agent_session_import_available(result)
+    result["external_agent_session_import_min_version"] = "0.128.0"
     print(json.dumps({"codex": result}, indent=2, ensure_ascii=False))
     if not result.get("compatible"):
         print(
@@ -687,6 +691,11 @@ def cmd_toolchain_doctor(args: argparse.Namespace) -> int:
         )
         return 1
     return 0
+
+
+def codex_external_agent_session_import_available(toolchain_result: dict[str, Any]) -> bool:
+    version = str(toolchain_result.get("version", ""))
+    return platform_orchestrator.codex_version_at_least(version, (0, 128, 0))
 
 
 def cmd_toolchain_pin_codex(args: argparse.Namespace) -> int:
@@ -998,6 +1007,7 @@ def inspect_target(target: Path) -> tuple[list[str], list[str]]:
             errors.append(
                 f"{workflow_path.relative_to(target)} is not pinned to {source_repo}@{source_ref}."
             )
+    warnings.extend(check_workflow_gate_triggers(target))
 
     if "REPLACE_WITH_GITHUB_OWNER" in source_repo:
         warnings.append(
@@ -1006,6 +1016,7 @@ def inspect_target(target: Path) -> tuple[list[str], list[str]]:
     warnings.extend(validate_transition_policy_shape(manifest))
 
     warnings.extend(check_codex_review_health(target, manifest))
+    warnings.extend(check_codex_external_agent_sessions(target))
     warnings.extend(check_orchestrator_registration(target, manifest))
 
     if adapter == "node-ts":
@@ -1750,6 +1761,95 @@ def check_worker_toolchain() -> list[str]:
         f"Reason: {result.get('reason') or 'unknown'}. "
         "Run `platform toolchain doctor` and pin a compatible binary if needed."
     ]
+
+
+def check_workflow_gate_triggers(target: Path) -> list[str]:
+    warnings: list[str] = []
+    workflows_dir = target / ".github" / "workflows"
+    if not workflows_dir.exists():
+        return warnings
+    for check_name in REQUIRED_CHECKS:
+        workflow_path = workflows_dir / f"{check_name}.yml"
+        if not workflow_path.exists():
+            continue
+        text = workflow_path.read_text(encoding="utf-8")
+        rel_path = workflow_path.relative_to(target)
+        if "pull_request" not in text:
+            warnings.append(f"{rel_path} does not declare a pull_request trigger.")
+        if "merge_group" not in text:
+            warnings.append(
+                f"{rel_path} does not declare a merge_group trigger. "
+                "Required checks may not run correctly with GitHub merge queue."
+            )
+        if f"name: {check_name}" not in text and f"name:\"{check_name}\"" not in text.replace(" ", ""):
+            warnings.append(
+                f"{rel_path} may not expose the required check name `{check_name}`. "
+                "Confirm branch protection required checks match workflow job names."
+            )
+    return warnings
+
+
+def check_codex_external_agent_sessions(target: Path) -> list[str]:
+    sessions = detect_external_agent_sessions_for_repo(target)
+    if not sessions:
+        return []
+    return [
+        f"Detected {len(sessions)} recent Claude Code session file(s) for this repo. "
+        "Codex CLI 0.128.0+ can optionally import external agent sessions for user history, "
+        "but orchestrator contracts/messages/decisions remain the source of truth."
+    ]
+
+
+def detect_external_agent_sessions_for_repo(target: Path, *, max_age_days: int = 30, limit: int = 50) -> list[dict[str, str]]:
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        return []
+    target_resolved = target.expanduser().resolve()
+    cutoff = time.time() - (max_age_days * 24 * 60 * 60)
+    matches: list[dict[str, str]] = []
+    for session_path in sorted(projects_dir.rglob("*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True):
+        if len(matches) >= limit:
+            break
+        with contextlib.suppress(OSError):
+            if session_path.stat().st_mtime < cutoff:
+                continue
+        session = external_agent_session_metadata(session_path, target_resolved)
+        if session:
+            matches.append(session)
+    return matches
+
+
+def external_agent_session_metadata(session_path: Path, target_resolved: Path) -> dict[str, str]:
+    title = ""
+    cwd = ""
+    try:
+        with session_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                cwd = cwd or str(item.get("cwd") or item.get("currentWorkingDirectory") or "")
+                title = title or str(item.get("customTitle") or item.get("custom-title") or item.get("aiTitle") or item.get("ai-title") or "")
+                message = item.get("message")
+                if not title and isinstance(message, dict):
+                    content = message.get("content")
+                    if isinstance(content, str):
+                        title = content.strip().splitlines()[0][:120]
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+                                title = str(part["text"]).strip().splitlines()[0][:120]
+                                break
+                if cwd and Path(cwd).expanduser().resolve() == target_resolved:
+                    return {"path": str(session_path), "cwd": cwd, "title": title}
+    except (OSError, RuntimeError):
+        return {}
+    return {}
 
 
 def run_optional(
