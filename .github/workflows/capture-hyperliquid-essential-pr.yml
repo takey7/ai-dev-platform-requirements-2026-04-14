@@ -1,0 +1,63 @@
+name: PR capture essential Hyperliquid target pages
+
+on:
+  pull_request:
+    paths:
+      - 'tmp/trigger-hyperliquid-essential.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  capture-essential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Playwright
+        run: |
+          npm init -y
+          npm install playwright@1.55.0
+          npx playwright install --with-deps chromium
+      - name: Capture essential target pages concurrently
+        env:
+          WALLET: '0x9c3fc764be4e6bd200f4dad19c43e8b4c8c73d20'
+        run: |
+          cat > capture-essential.mjs <<'EOF'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          const wallet=process.env.WALLET;
+          const out='target-wallet-essential';fs.mkdirSync(out,{recursive:true});
+          const targets=[
+            {slug:'official_explorer',name:'Hyperliquid Official Explorer',url:`https://app.hyperliquid.xyz/explorer/address/${wallet}`},
+            {slug:'hypurrscan',name:'Hypurrscan',url:`https://hypurrscan.io/address/${wallet}`},
+            {slug:'coinglass',name:'CoinGlass',url:`https://www.coinglass.com/zh-TW/hyperliquid/${wallet}`},
+            {slug:'hyperevmscan',name:'HyperEVMScan',url:`https://hyperevmscan.io/address/${wallet}`}
+          ];
+          const browser=await chromium.launch({headless:true,args:['--disable-blink-features=AutomationControlled','--disable-dev-shm-usage','--no-sandbox']});
+          async function capture(t){
+            const ctx=await browser.newContext({viewport:{width:1600,height:1200},locale:'en-US',timezoneId:'UTC',userAgent:'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'});
+            const page=await ctx.newPage();await page.addInitScript(()=>Object.defineProperty(navigator,'webdriver',{get:()=>undefined}));
+            const r={...t,startedAt:new Date().toISOString()};
+            try{
+              const resp=await page.goto(t.url,{waitUntil:'domcontentloaded',timeout:45000});r.status=resp?.status()??null;
+              await page.waitForTimeout(14000);
+              for(const re of [/accept all/i,/accept/i,/agree/i,/allow all/i,/got it/i,/close/i]){try{const b=page.getByRole('button',{name:re}).first();if(await b.count()&&await b.isVisible({timeout:500})){await b.click();}}catch{}}
+              await page.waitForTimeout(3000);r.finalUrl=page.url();r.title=await page.title().catch(()=>"");r.bodyText=(await page.locator('body').innerText().catch(()=>"")).slice(0,25000);r.walletInBody=r.bodyText.toLowerCase().includes(wallet.toLowerCase());r.walletInUrl=r.finalUrl.toLowerCase().includes(wallet.toLowerCase());r.capturedAt=new Date().toISOString();
+              await page.screenshot({path:path.join(out,`${t.slug}_target_wallet.png`),fullPage:false,animations:'disabled'});fs.writeFileSync(path.join(out,`${t.slug}_page.html`),await page.content().catch(()=>""),'utf8');r.saved=true;
+            }catch(e){r.error=String(e?.stack||e);r.finalUrl=page.url();try{await page.screenshot({path:path.join(out,`${t.slug}_failed.png`),fullPage:false});}catch{}}
+            await ctx.close();return r;
+          }
+          const results=await Promise.all(targets.map(capture));await browser.close();fs.writeFileSync(path.join(out,'capture_results.json'),JSON.stringify(results,null,2));
+          EOF
+          node capture-essential.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperliquid-target-wallet-essential
+          path: target-wallet-essential/
+          if-no-files-found: error
+          retention-days: 7
