@@ -1,0 +1,85 @@
+name: PR capture Hyperliquid target wallet pages
+
+on:
+  pull_request:
+    paths:
+      - 'tmp/trigger-hyperliquid-capture.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Playwright
+        run: |
+          npm init -y
+          npm install playwright@1.55.0
+          npx playwright install --with-deps chromium
+      - name: Capture actual target wallet pages
+        env:
+          WALLET: '0x9c3fc764be4e6bd200f4dad19c43e8b4c8c73d20'
+        run: |
+          cat > /tmp/capture.mjs <<'EOF'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          const wallet = process.env.WALLET;
+          const out = 'target-wallet-captures';
+          fs.mkdirSync(out, {recursive:true});
+          const targets = [
+            {slug:'official_explorer', name:'Hyperliquid Official Explorer', urls:[`https://app.hyperliquid.xyz/explorer/address/${wallet}`]},
+            {slug:'hypurrscan', name:'Hypurrscan', urls:[`https://hypurrscan.io/address/${wallet}`,`https://www.hypurrscan.io/address/${wallet}`]},
+            {slug:'coinglass', name:'CoinGlass', urls:[`https://www.coinglass.com/zh-TW/hyperliquid/${wallet}`,`https://www.coinglass.com/hyperliquid/${wallet}`]},
+            {slug:'hyperevmscan', name:'HyperEVMScan', urls:[`https://hyperevmscan.io/address/${wallet}`]},
+            {slug:'hyperdash', name:'Hyperdash', urls:[`https://hyperdash.com/address/${wallet}`,`https://hyperdash.info/address/${wallet}`]},
+            {slug:'dexly', name:'Dexly', urls:[`https://dexly.trade/hyperliquid/explorer/${wallet}`,'https://dexly.trade/hyperliquid/explorer'], search:true},
+            {slug:'hypertracker', name:'HyperTracker', urls:['https://hypertracker.io/'], search:true},
+            {slug:'labelyx', name:'LabelYX', urls:['https://labelyx.com/'], search:true},
+            {slug:'arkm', name:'ARKM', urls:[`https://intel.arkm.com/explorer/address/${wallet}`,`https://platform.arkhamintelligence.com/explorer/address/${wallet}`]},
+            {slug:'dexmetrics', name:'Dexmetrics', urls:['https://dexmetrics.org/'], search:true}
+          ];
+          const browser = await chromium.launch({headless:true,args:['--disable-blink-features=AutomationControlled','--disable-dev-shm-usage','--no-sandbox']});
+          const results=[];
+          for (const t of targets) {
+            const ctx=await browser.newContext({viewport:{width:1600,height:1200},locale:'en-US',timezoneId:'UTC',userAgent:'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'});
+            const page=await ctx.newPage();
+            await page.addInitScript(()=>Object.defineProperty(navigator,'webdriver',{get:()=>undefined}));
+            const attempts=[]; let saved=false;
+            for (const url of t.urls) {
+              const a={url,startedAt:new Date().toISOString()};
+              try {
+                const r=await page.goto(url,{waitUntil:'domcontentloaded',timeout:60000});
+                a.status=r?.status()??null;
+                await page.waitForTimeout(12000);
+                if (t.search) {
+                  const sels=['input[placeholder*="wallet" i]','input[placeholder*="address" i]','input[placeholder*="0x" i]','input[type="search"]','input[type="text"]'];
+                  for (const s of sels) { const q=page.locator(s).first(); try { if(await q.count()&&await q.isVisible({timeout:800})){await q.fill(wallet);await q.press('Enter');a.searchSelector=s;a.searchFilled=true;break;} } catch{} }
+                  await page.waitForTimeout(15000);
+                }
+                for(const re of [/accept all/i,/accept/i,/agree/i,/allow all/i,/got it/i,/close/i]){try{const b=page.getByRole('button',{name:re}).first();if(await b.count()&&await b.isVisible({timeout:500})){await b.click();await page.waitForTimeout(500);}}catch{}}
+                await page.waitForTimeout(4000);
+                a.finalUrl=page.url();a.title=await page.title().catch(()=>"");a.bodyText=(await page.locator('body').innerText().catch(()=>"")).slice(0,20000);a.walletInBody=a.bodyText.toLowerCase().includes(wallet.toLowerCase());a.walletInUrl=a.finalUrl.toLowerCase().includes(wallet.toLowerCase());a.capturedAt=new Date().toISOString();
+                await page.screenshot({path:path.join(out,`${t.slug}_target_wallet.png`),fullPage:false,animations:'disabled'});
+                fs.writeFileSync(path.join(out,`${t.slug}_page.html`),await page.content().catch(()=>""),'utf8');
+                attempts.push(a);saved=true;break;
+              } catch(e) {a.error=String(e?.stack||e);a.finalUrl=page.url();attempts.push(a);try{await page.screenshot({path:path.join(out,`${t.slug}_failed.png`),fullPage:false});}catch{}}
+            }
+            results.push({slug:t.slug,name:t.name,wallet,saved,attempts});await ctx.close();
+          }
+          await browser.close();
+          fs.writeFileSync(path.join(out,'capture_results.json'),JSON.stringify(results,null,2));
+          EOF
+          node /tmp/capture.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperliquid-target-wallet-captures
+          path: target-wallet-captures/
+          if-no-files-found: error
+          retention-days: 7
