@@ -1,0 +1,47 @@
+name: PR query Hyperdash target-day PnL
+
+on:
+  pull_request:
+    paths:
+      - 'tmp/trigger-hyperdash-target-day.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Query Hyperdash public GraphQL
+        env:
+          WALLET: '0x9c3fc764be4e6bd200f4dad19c43e8b4c8c73d20'
+        run: |
+          mkdir -p hyperdash-target-day
+          cat > query.mjs <<'EOF'
+          import fs from 'node:fs';
+          const wallet=process.env.WALLET;
+          const query=`query GetPnlCalendar($walletAddress: String!, $startDate: DateTime, $endDate: DateTime) { pnlCalendar(walletAddress: $walletAddress startDate: $startDate endDate: $endDate) { calendar { date pnl pnlPercent __typename } __typename } }`;
+          const payload={operationName:'GetPnlCalendar',variables:{walletAddress:wallet,startDate:'2025-07-20T00:00:00.000Z',endDate:'2025-07-22T23:59:59.999Z'},query};
+          const startedAt=new Date().toISOString();
+          const response=await fetch('https://api.hyperdash.com/graphql',{method:'POST',headers:{'content-type':'application/json','accept':'application/json','origin':'https://hyperdash.com','referer':`https://hyperdash.com/address/${wallet}`},body:JSON.stringify(payload)});
+          const text=await response.text();
+          const meta={startedAt,capturedAt:new Date().toISOString(),status:response.status,statusText:response.statusText,url:response.url,request:payload,responseHeaders:Object.fromEntries(response.headers.entries()),sha256:null};
+          const crypto=await import('node:crypto');meta.sha256=crypto.createHash('sha256').update(text).digest('hex');
+          fs.writeFileSync('hyperdash-target-day/request.json',JSON.stringify(payload,null,2));
+          fs.writeFileSync('hyperdash-target-day/response.json',text);
+          fs.writeFileSync('hyperdash-target-day/meta.json',JSON.stringify(meta,null,2));
+          if(!response.ok) process.exitCode=1;
+          EOF
+          node query.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hyperdash-target-day
+          path: hyperdash-target-day/
+          if-no-files-found: error
+          retention-days: 7
