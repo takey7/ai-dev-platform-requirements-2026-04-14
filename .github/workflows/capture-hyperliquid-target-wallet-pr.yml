@@ -26,7 +26,7 @@ jobs:
         env:
           WALLET: '0x9c3fc764be4e6bd200f4dad19c43e8b4c8c73d20'
         run: |
-          cat > /tmp/capture.mjs <<'EOF'
+          cat > capture.mjs <<'EOF'
           import { chromium } from 'playwright';
           import fs from 'node:fs';
           import path from 'node:path';
@@ -76,7 +76,7 @@ jobs:
           await browser.close();
           fs.writeFileSync(path.join(out,'capture_results.json'),JSON.stringify(results,null,2));
           EOF
-          node /tmp/capture.mjs
+          node capture.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: hyperliquid-target-wallet-captures
