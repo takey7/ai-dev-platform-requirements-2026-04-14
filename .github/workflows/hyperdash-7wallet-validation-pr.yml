@@ -1,0 +1,258 @@
+name: Hyperdash 7-wallet external validation
+
+on:
+  pull_request:
+    paths:
+      - 'tmp/trigger-hyperdash-7wallet.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Playwright
+        run: |
+          npm init -y
+          npm install playwright@1.55.0
+          npx playwright install --with-deps chromium
+      - name: Query Hyperdash, official APIs, and capture evidence
+        run: |
+          cat > validate.mjs <<'EOF'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import crypto from 'node:crypto';
+
+          const input = JSON.parse(fs.readFileSync('tmp/hl7_samples.json', 'utf8'));
+          const out = 'hyperdash-7wallet-evidence';
+          fs.mkdirSync(out, { recursive: true });
+          const wallets = [...new Set(input.samples.map(x => x.wallet))].sort();
+          const zeroHash = '0x' + '0'.repeat(64);
+          const uniqueHashes = [...new Set(input.samples.map(x => x.hash).filter(x => x && x !== zeroHash))].sort();
+
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          const sha256 = s => crypto.createHash('sha256').update(s).digest('hex');
+          const safeName = s => s.replace(/[^a-zA-Z0-9_.-]+/g, '_');
+          const iso = ms => new Date(ms).toISOString();
+
+          async function fetchText(url, options = {}, attempts = 4) {
+            let last = null;
+            for (let i = 1; i <= attempts; i++) {
+              try {
+                const res = await fetch(url, options);
+                const text = await res.text();
+                return { ok: res.ok, status: res.status, statusText: res.statusText, url: res.url, headers: Object.fromEntries(res.headers.entries()), text, sha256: sha256(text), capturedAt: new Date().toISOString() };
+              } catch (e) {
+                last = String(e?.stack || e);
+                await sleep(i * 800);
+              }
+            }
+            return { ok: false, status: null, error: last, capturedAt: new Date().toISOString(), text: '' };
+          }
+
+          async function postJson(url, payload) {
+            const body = JSON.stringify(payload);
+            const result = await fetchText(url, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json', origin: 'https://hyperdash.com', referer: 'https://hyperdash.com/' }, body });
+            let json = null;
+            try { json = JSON.parse(result.text); } catch {}
+            return { ...result, request: payload, json };
+          }
+
+          function writeJson(file, value) {
+            fs.mkdirSync(path.dirname(file), { recursive: true });
+            fs.writeFileSync(file, JSON.stringify(value, null, 2));
+          }
+
+          const graphqlQuery = `query SevenWalletAudit($address: String!, $walletAddress: String!, $startDate: DateTime, $endDate: DateTime) {
+            getTrader(address: $address) {
+              address label verified displayName pnl perpsEquity totalTrades trades7d trades30d
+              portfolioGraph { timestamp value }
+            }
+            pnlCalendar(walletAddress: $walletAddress startDate: $startDate endDate: $endDate) {
+              calendar { date pnl pnlPercent }
+            }
+            getTraderDetailedStatsSummary(address: $address) {
+              tradeCount startDate endDate completedTradePnl { pnl longPnl shortPnl fees net }
+            }
+            getTraderCompletedTrades(address: $address page: 1 pageSize: 200) {
+              tradeCount assetTradeCounts { coin tradeCount }
+              trades { startTime endTime coin direction durationMins sz avgEntryPx avgExitPx grossPnl fundingPnl totalFees netPnl notional }
+            }
+          }`;
+
+          const graphqlResults = [];
+          for (const wallet of wallets) {
+            const rows = input.samples.filter(x => x.wallet === wallet);
+            const minT = Math.min(...rows.map(x => x.t));
+            const maxT = Math.max(...rows.map(x => x.t));
+            const startDate = new Date(minT - 86400000).toISOString();
+            const endDate = new Date(maxT + 86400000).toISOString();
+            const payload = { operationName: 'SevenWalletAudit', variables: { address: wallet, walletAddress: wallet, startDate, endDate }, query: graphqlQuery };
+            const result = await postJson('https://api.hyperdash.com/graphql', payload);
+            writeJson(path.join(out, 'raw', 'hyperdash_graphql', wallet, 'request.json'), payload);
+            fs.writeFileSync(path.join(out, 'raw', 'hyperdash_graphql', wallet, 'response.json'), result.text || '');
+            writeJson(path.join(out, 'raw', 'hyperdash_graphql', wallet, 'meta.json'), { ...result, text: undefined, json: undefined });
+            graphqlResults.push({ wallet, status: result.status, ok: result.ok, sha256: result.sha256, error: result.error || null });
+            await sleep(250);
+          }
+
+          const introspection = await postJson('https://api.hyperdash.com/graphql', { query: `query IntrospectCompletedTradeFilter { __type(name: "TraderCompletedTradesFilterInput") { name inputFields { name type { kind name ofType { kind name ofType { kind name } } } } } }` });
+          fs.writeFileSync(path.join(out, 'raw', 'hyperdash_graphql', 'filter_introspection_response.json'), introspection.text || '');
+          writeJson(path.join(out, 'raw', 'hyperdash_graphql', 'filter_introspection_meta.json'), { ...introspection, text: undefined, json: undefined });
+
+          const timeGroups = new Map();
+          for (const s of input.samples) {
+            const key = `${s.wallet}|${s.t}`;
+            if (!timeGroups.has(key)) timeGroups.set(key, { wallet: s.wallet, time: s.t, sampleIds: [] });
+            timeGroups.get(key).sampleIds.push(s.id);
+          }
+
+          const exactProbeResults = [];
+          for (const group of timeGroups.values()) {
+            const payloadFalse = { type: 'userFillsByTime', user: group.wallet, startTime: group.time - 2, endTime: group.time + 2, aggregateByTime: false };
+            const payloadTrue = { ...payloadFalse, aggregateByTime: true };
+            const dir = path.join(out, 'raw', 'sample_time_probes', group.wallet, String(group.time));
+            for (const [source, url] of [['hyperdash_proxy', 'https://h.hyperdash.com/info'], ['official_info', 'https://api.hyperliquid.xyz/info']]) {
+              for (const [grain, payload] of [['unaggregated', payloadFalse], ['aggregated', payloadTrue]]) {
+                const result = await postJson(url, payload);
+                writeJson(path.join(dir, `${source}_${grain}_request.json`), payload);
+                fs.writeFileSync(path.join(dir, `${source}_${grain}_response.json`), result.text || '');
+                writeJson(path.join(dir, `${source}_${grain}_meta.json`), { status: result.status, ok: result.ok, sha256: result.sha256 || null, capturedAt: result.capturedAt, error: result.error || null, url: result.url || url });
+                exactProbeResults.push({ wallet: group.wallet, time: group.time, sampleIds: group.sampleIds, source, grain, status: result.status, count: Array.isArray(result.json) ? result.json.length : null, sha256: result.sha256 || null, error: result.error || null });
+              }
+            }
+            await sleep(120);
+          }
+
+          async function recursiveRange(source, url, wallet, start, end, depth = 0) {
+            const payload = { type: 'userFillsByTime', user: wallet, startTime: start, endTime: end, aggregateByTime: false };
+            const result = await postJson(url, payload);
+            const rows = Array.isArray(result.json) ? result.json : null;
+            const node = { source, wallet, start, end, depth, status: result.status, count: rows ? rows.length : null, sha256: result.sha256 || null, error: result.error || null, rows: rows || null };
+            if (rows && rows.length >= 2000 && depth < 10 && end - start > 4) {
+              const mid = Math.floor((start + end) / 2);
+              node.rows = null;
+              node.children = [await recursiveRange(source, url, wallet, start, mid, depth + 1), await recursiveRange(source, url, wallet, mid + 1, end, depth + 1)];
+            }
+            return node;
+          }
+
+          function flattenRows(node, outRows = []) {
+            if (Array.isArray(node.rows)) outRows.push(...node.rows);
+            if (Array.isArray(node.children)) for (const c of node.children) flattenRows(c, outRows);
+            return outRows;
+          }
+
+          const rangeResults = [];
+          for (const w of input.windows) {
+            for (const [source, url] of [['hyperdash_proxy', 'https://h.hyperdash.com/info'], ['official_info', 'https://api.hyperliquid.xyz/info']]) {
+              const tree = await recursiveRange(source, url, w.wallet, w.start, w.end);
+              const rows = flattenRows(tree, []);
+              const dedupe = new Map();
+              for (const r of rows) {
+                const key = `${r.hash || ''}|${r.tid ?? ''}|${r.oid ?? ''}|${r.time ?? ''}|${r.coin || ''}|${r.px || ''}|${r.sz || ''}`;
+                dedupe.set(key, r);
+              }
+              const dir = path.join(out, 'raw', 'source_windows', w.id, source);
+              writeJson(path.join(dir, 'request_window.json'), w);
+              writeJson(path.join(dir, 'range_tree.json'), tree);
+              writeJson(path.join(dir, 'deduped_rows.json'), [...dedupe.values()]);
+              rangeResults.push({ windowId: w.id, wallet: w.wallet, source, status: tree.status, rawRows: rows.length, dedupedRows: dedupe.size, start: w.start, end: w.end, error: tree.error || null });
+            }
+            await sleep(150);
+          }
+
+          const txResults = [];
+          for (const hash of uniqueHashes) {
+            const result = await postJson('https://rpc.hyperliquid.xyz/explorer', { type: 'txDetails', hash });
+            const dir = path.join(out, 'raw', 'explorer_tx', hash);
+            writeJson(path.join(dir, 'request.json'), { type: 'txDetails', hash });
+            fs.writeFileSync(path.join(dir, 'response.json'), result.text || '');
+            writeJson(path.join(dir, 'meta.json'), { status: result.status, ok: result.ok, sha256: result.sha256 || null, capturedAt: result.capturedAt, error: result.error || null, url: result.url || 'https://rpc.hyperliquid.xyz/explorer' });
+            txResults.push({ hash, status: result.status, ok: result.ok, sha256: result.sha256 || null, error: result.error || null });
+            await sleep(100);
+          }
+
+          const browser = await chromium.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage', '--no-sandbox'] });
+          const screenshotMeta = [];
+          async function capture(target) {
+            const context = await browser.newContext({ viewport: { width: 1600, height: 1100 }, locale: 'en-US', timezoneId: 'UTC', userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36' });
+            await context.addInitScript(() => Object.defineProperty(navigator, 'webdriver', { get: () => undefined }));
+            const page = await context.newPage();
+            const meta = { ...target, startedAt: new Date().toISOString() };
+            try {
+              const response = await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 55000 });
+              meta.status = response?.status() ?? null;
+              await page.waitForTimeout(target.wait || 9000);
+              for (const name of [/accept all/i, /^accept$/i, /agree/i, /allow all/i, /got it/i, /^close$/i]) {
+                try { const b = page.getByRole('button', { name }).first(); if (await b.count() && await b.isVisible({ timeout: 400 })) { await b.click(); await page.waitForTimeout(400); } } catch {}
+              }
+              if (target.site === 'Hyperdash' && target.mode === 'calendar') {
+                for (const role of ['tab', 'button', 'link']) {
+                  try { const el = page.getByRole(role, { name: /calendar/i }).first(); if (await el.count() && await el.isVisible({ timeout: 700 })) { await el.click(); meta.clicked = `${role}:calendar`; await page.waitForTimeout(7000); break; } } catch {}
+                }
+              }
+              meta.finalUrl = page.url();
+              meta.title = await page.title().catch(() => '');
+              meta.bodyText = (await page.locator('body').innerText().catch(() => '')).slice(0, 25000);
+              meta.walletVisible = target.wallet ? (meta.bodyText.toLowerCase().includes(target.wallet.toLowerCase()) || meta.finalUrl.toLowerCase().includes(target.wallet.toLowerCase())) : null;
+              meta.hashVisible = target.hash ? (meta.bodyText.toLowerCase().includes(target.hash.toLowerCase()) || meta.finalUrl.toLowerCase().includes(target.hash.toLowerCase())) : null;
+              meta.capturedAt = new Date().toISOString();
+              const file = path.join(out, 'screenshots', `${safeName(target.id)}.png`);
+              fs.mkdirSync(path.dirname(file), { recursive: true });
+              await page.screenshot({ path: file, fullPage: false, animations: 'disabled' });
+              meta.screenshot = path.relative(out, file);
+              fs.writeFileSync(path.join(out, 'screenshots', `${safeName(target.id)}.html`), await page.content().catch(() => ''), 'utf8');
+            } catch (e) {
+              meta.error = String(e?.stack || e);
+              meta.finalUrl = page.url();
+              meta.capturedAt = new Date().toISOString();
+              try { const file = path.join(out, 'screenshots', `${safeName(target.id)}_failed.png`); fs.mkdirSync(path.dirname(file), { recursive: true }); await page.screenshot({ path: file, fullPage: false }); meta.screenshot = path.relative(out, file); } catch {}
+            }
+            await context.close();
+            return meta;
+          }
+
+          const targets = [];
+          for (const wallet of wallets) {
+            targets.push({ id: `hyperdash_${wallet}_overview`, site: 'Hyperdash', mode: 'overview', wallet, url: `https://hyperdash.com/address/${wallet}`, wait: 12000 });
+            targets.push({ id: `hyperdash_${wallet}_calendar`, site: 'Hyperdash', mode: 'calendar', wallet, url: `https://hyperdash.com/address/${wallet}`, wait: 12000 });
+            targets.push({ id: `official_explorer_${wallet}`, site: 'Official Explorer', mode: 'wallet', wallet, url: `https://app.hyperliquid.xyz/explorer/address/${wallet}`, wait: 9000 });
+            targets.push({ id: `hypurrscan_${wallet}`, site: 'Hypurrscan', mode: 'wallet', wallet, url: `https://hypurrscan.io/address/${wallet}`, wait: 10000 });
+            targets.push({ id: `hypertracker_${wallet}`, site: 'HyperTracker', mode: 'wallet', wallet, url: `https://app.coinmarketman.com/hypertracker?wallet=${wallet}`, wait: 10000 });
+          }
+          for (const hash of uniqueHashes) targets.push({ id: `official_tx_${hash}`, site: 'Official Explorer', mode: 'tx', hash, url: `https://app.hyperliquid.xyz/explorer/tx/${hash}`, wait: 9000 });
+
+          async function mapLimit(items, limit, fn) {
+            const results = new Array(items.length);
+            let next = 0;
+            async function worker() { while (true) { const i = next++; if (i >= items.length) return; results[i] = await fn(items[i]); } }
+            await Promise.all(Array.from({ length: limit }, worker));
+            return results;
+          }
+          screenshotMeta.push(...await mapLimit(targets, 5, capture));
+          await browser.close();
+
+          writeJson(path.join(out, 'manifests', 'graphql_results.json'), graphqlResults);
+          writeJson(path.join(out, 'manifests', 'exact_probe_results.json'), exactProbeResults);
+          writeJson(path.join(out, 'manifests', 'range_results.json'), rangeResults);
+          writeJson(path.join(out, 'manifests', 'tx_results.json'), txResults);
+          writeJson(path.join(out, 'manifests', 'screenshot_manifest.json'), screenshotMeta);
+          writeJson(path.join(out, 'manifests', 'input_copy.json'), input);
+          writeJson(path.join(out, 'capture_summary.json'), { generatedAt: new Date().toISOString(), wallets, sampleCount: input.samples.length, sourceWindowCount: input.windows.length, uniqueNonzeroHashes: uniqueHashes.length, graphqlResults, exactProbeCount: exactProbeResults.length, rangeResults, txResults, screenshotCount: screenshotMeta.length });
+          EOF
+          node validate.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hyperdash-7wallet-evidence
+          path: hyperdash-7wallet-evidence/
+          if-no-files-found: error
+          retention-days: 7
