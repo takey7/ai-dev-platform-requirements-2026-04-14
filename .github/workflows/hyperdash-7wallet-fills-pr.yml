@@ -1,0 +1,54 @@
+name: Capture Hyperdash seven-wallet Fills tabs
+
+on:
+  pull_request:
+    paths:
+      - 'tmp/trigger-hyperdash-7wallet-fills.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  capture-fills:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: |
+          npm init -y
+          npm install playwright@1.55.0
+          npx playwright install --with-deps chromium
+      - name: Capture Fills tabs
+        run: |
+          cat > capture-fills.mjs <<'EOF'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+          const wallets = ['0x69443708e5135532d435b7d1a3b7e6bdc481a800','0x1eee2984a6d47324d8742dfb3df58ce7dbe7e495','0x31ca8395cf837de08b24da3f660e77761dfb974b','0xecb63caa47c7c4e77f60f1ce858cf28dc2b82b00','0x842c3f25e45513982b31519566569963d717742b','0x625e239e46d3ad052e23f396de3a569f6fd504e7','0x4c567436612c90e37e02a1c05b72c834888ba6c7'];
+          const out='hyperdash-fills-tabs'; fs.mkdirSync(out,{recursive:true});
+          const browser=await chromium.launch({headless:true,args:['--disable-blink-features=AutomationControlled','--no-sandbox']});
+          async function one(wallet){
+            const ctx=await browser.newContext({viewport:{width:1600,height:1100},locale:'en-US',timezoneId:'UTC',userAgent:'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36'});
+            const page=await ctx.newPage(); const meta={wallet,url:`https://hyperdash.com/address/${wallet}`,startedAt:new Date().toISOString()};
+            try{
+              const response=await page.goto(meta.url,{waitUntil:'domcontentloaded',timeout:55000});meta.status=response?.status()??null;await page.waitForTimeout(11000);
+              let clicked=false;
+              for(const role of ['tab','button','link']){try{const el=page.getByRole(role,{name:/^fills$/i}).first();if(await el.count()&&await el.isVisible({timeout:800})){await el.click();meta.clickedRole=role;clicked=true;break;}}catch{}}
+              if(!clicked){try{const el=page.getByText('FILLS',{exact:true}).first();if(await el.count()&&await el.isVisible({timeout:800})){await el.click();clicked=true;meta.clickedRole='text';}}catch{}}
+              meta.clicked=clicked;await page.waitForTimeout(7000);meta.finalUrl=page.url();meta.title=await page.title();meta.bodyText=(await page.locator('body').innerText().catch(()=>'' )).slice(0,30000);meta.walletVisible=meta.bodyText.toLowerCase().includes(wallet.toLowerCase())||meta.finalUrl.toLowerCase().includes(wallet.toLowerCase());meta.capturedAt=new Date().toISOString();
+              await page.screenshot({path:`${out}/hyperdash_${wallet}_fills.png`,fullPage:false,animations:'disabled'});fs.writeFileSync(`${out}/hyperdash_${wallet}_fills.html`,await page.content().catch(()=>''));
+            }catch(e){meta.error=String(e?.stack||e);try{await page.screenshot({path:`${out}/hyperdash_${wallet}_fills_failed.png`,fullPage:false});}catch{}}
+            fs.writeFileSync(`${out}/hyperdash_${wallet}_fills_meta.json`,JSON.stringify(meta,null,2));await ctx.close();return meta;
+          }
+          const results=await Promise.all(wallets.map(one));await browser.close();fs.writeFileSync(`${out}/capture_results.json`,JSON.stringify(results,null,2));
+          EOF
+          node capture-fills.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hyperdash-seven-wallet-fills-tabs
+          path: hyperdash-fills-tabs/
+          if-no-files-found: error
+          retention-days: 7
