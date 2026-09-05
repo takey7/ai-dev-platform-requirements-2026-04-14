@@ -1,0 +1,89 @@
+name: FR follow-up evidence 20260905
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/fr-followup-20260905.yml'
+permissions:
+  contents: read
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install browser
+        run: |
+          mkdir -p /tmp/fr-audit
+          cd /tmp/fr-audit
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+      - name: Read public FR and wallet views
+        run: |
+          cd /tmp/fr-audit
+          cat > collect.mjs <<'EOF'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          import {chromium} from 'playwright';
+          const out=process.env.GITHUB_WORKSPACE+'/fr-followup-evidence';
+          fs.mkdirSync(out,{recursive:true});
+          const write=(name,x)=>fs.writeFileSync(out+'/'+name,JSON.stringify(x,null,2));
+          const wait=ms=>new Promise(r=>setTimeout(r,ms));
+          const wallets=['0x1eee2984a6d47324d8742dfb3df58ce7dbe7e495','0x31ca8395cf837de08b24da3f660e77761dfb974b','0x69443708e5135532d435b7d1a3b7e6bdc481a800','0x842c3f25e45513982b31519566569963d717742b','0xecb63caa47c7c4e77f60f1ce858cf28dc2b82b00'];
+          const coins='0G,2Z,AAVE,ACE,ADA,AERO,AIXBT,ALGO,ALT,ANIME,APE,APEX,APT,AR,ARB,ARK,ASTER,ATOM,AVAX,AVNT,BABY,BANANA,BCH,BERA,BIGTIME,BIO,BLAST,BLUR,BNB,BOME,BRETT,BSV,BTC,CAKE,CC,CELO,CFX,CHILLGUY,COMP,CRV,DOGE,DOOD,DOT,DYDX,DYM,EIGEN,ENA,ENS,ETC,ETH,ETHFI,FARTCOIN,FET,FIL,FOGO,FTT,GALA,GAS,GMT,GMX,GOAT,GRASS,GRIFFAIN,HBAR,HEMI,HYPE,HYPER,ICP,IMX,INIT,INJ,IO,IOTA,IP,JTO,JUP,KAITO,KAS,LAYER,LDO,LINEA,LINK,LIT,LTC,MANTA,MAV,MAVIA,ME,MELANIA,MEME,MERL,MET,MEW,MINA,MNT,MON,MOODENG,MORPHO,MOVE,NEAR,NEO,NIL,NOT,NXPC,OM,ONDO,OP,ORDI,PAXG,PENDLE,PENGU,PEOPLE,PNUT,POL,POLYX,POPCAT,PROMPT,PROVE,PUMP,PURR,PYTH,RENDER,RESOLV,REZ,RSR,RUNE,S,SAGA,SAND,SAND,SCR,SEI,SKY,SNX,SOL,SOPH,SPX,STABLE,STBL,STRK,STX,SUI,SUPER,SUSHI,SYRUP,TAO,TIA,TON,TRB,TRUMP,TRX,TST,TURBO,UMA,UNI,USTC,USUAL,VINE,VIRTUAL,VVV,W,WCT,WIF,WLD,WLFI,XAI,XLM,XMR,XPL,XRP,YGG,ZEC,ZEN,ZEREBRO,ZETA,ZK,ZORA,ZRO,kBONK,kFLOKI,kLUNC,kNEIRO,kPEPE,kSHIB'.split(',');
+          const endpoints=[['official','https://api.hyperliquid.xyz/info'],['hyperdash_proxy','https://h.hyperdash.com/info']];
+          let last=0;
+          async function post(source,url,body){
+            await wait(Math.max(0,1350-(Date.now()-last)));last=Date.now();
+            const rec={source,url,request:body,started_at:new Date().toISOString()};
+            try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(25000)});rec.status=r.status;rec.response_text=await r.text();rec.response_sha256=crypto.createHash('sha256').update(rec.response_text).digest('hex');}
+            catch(e){rec.error=String(e);}
+            rec.finished_at=new Date().toISOString();return rec;
+          }
+          const fr=[];const jobs=[...new Set(coins)].map(coin=>({coin,startTime:1768550400000,endTime:1768557600000}));jobs.push({coin:'BTC',startTime:1753056000000,endTime:1753059600000});
+          for(let i=0;i<jobs.length;i++){
+            for(const [source,url] of endpoints)fr.push(await post(source,url,{type:'fundingHistory',...jobs[i]}));
+            if(i%15===0){write('historical_fr.json',fr);console.log('FR coin batches',i+1,'/',jobs.length);}
+          }
+          write('historical_fr.json',fr);
+          const uf=[];
+          for(const user of wallets){const day=user===wallets[0]?[1753056000000,1753142399999]:[1768521600000,1768607999999];for(const [source,url] of endpoints)uf.push(await post(source,url,{type:'userFunding',user,startTime:day[0],endTime:day[1]}));}
+          write('historical_user_funding_reference_only.json',uf);
+          const browser=await chromium.launch({headless:true});
+          const screens=[];
+          for(const wallet of wallets){
+            const ctx=await browser.newContext({viewport:{width:1600,height:1200},locale:'en-US',timezoneId:'UTC'});const page=await ctx.newPage();
+            const network=[];const pending=[];const ws=[];
+            page.on('response',r=>{const p=(async()=>{try{const req=r.request();if(!['xhr','fetch'].includes(req.resourceType()))return;const u=new URL(r.url());if(!['h.hyperdash.com','api.hyperdash.com','api.hyperliquid.xyz'].includes(u.hostname))return;const b=await r.text();if(b.length<2000000)network.push({url:r.url(),status:r.status(),request:req.postData(),body:b,at:new Date().toISOString()});}catch{}})();pending.push(p);});
+            page.on('websocket',s=>s.on('framereceived',e=>{const t=String(e.payload);if(t.length<2000000&&/webData|clearinghouseState|activeAssetCtx|allDexsAssetCtxs/.test(t)&&ws.length<12)ws.push({url:s.url(),at:new Date().toISOString(),body:t});}));
+            const rec={wallet,requested_url:'https://hyperdash.com/address/'+wallet,started_at:new Date().toISOString()};
+            try{
+              const r=await page.goto(rec.requested_url,{waitUntil:'domcontentloaded',timeout:50000});rec.http_status=r?.status();await page.waitForTimeout(13000);
+              rec.final_url=page.url();rec.body_text=await page.locator('body').innerText();rec.captured_at=new Date().toISOString();
+              rec.funding_cells=await page.locator('[data-col-id="funding"]').evaluateAll(es=>es.map(e=>({text:e.innerText,title:e.getAttribute('title')})));
+              rec.positions_table=await page.locator('[style*="--col-funding"]').evaluateAll(es=>es.map(e=>e.innerText));
+              await page.screenshot({path:out+'/'+wallet+'_overview.png',fullPage:false});
+              const h=page.locator('[data-col-id="funding"]').first();if(await h.count()){await h.hover();await page.waitForTimeout(1000);rec.hover_text=await page.locator('body').innerText();await page.screenshot({path:out+'/'+wallet+'_funding_hover.png',fullPage:false});}
+              rec.official_state=await post('official',endpoints[0][1],{type:'clearinghouseState',user:wallet});
+              rec.proxy_state=await post('hyperdash_proxy',endpoints[1][1],{type:'clearinghouseState',user:wallet});
+            }catch(e){rec.error=String(e);}
+            await Promise.allSettled(pending);write(wallet+'_network.json',network);write(wallet+'_websocket.json',ws);write(wallet+'_capture.json',rec);screens.push(rec);await ctx.close();
+          }
+          const ctx=await browser.newContext({viewport:{width:1600,height:1200},locale:'en-US',timezoneId:'UTC'});const page=await ctx.newPage();const m={requested_url:'https://hyperdash.com/trade',started_at:new Date().toISOString()};
+          try{const r=await page.goto(m.requested_url,{waitUntil:'domcontentloaded',timeout:50000});m.status=r?.status();await page.waitForTimeout(13000);m.final_url=page.url();m.body_text=await page.locator('body').innerText();m.captured_at=new Date().toISOString();await page.screenshot({path:out+'/trade_funding_rate.png',fullPage:false});m.official_meta=await post('official',endpoints[0][1],{type:'metaAndAssetCtxs'});m.proxy_meta=await post('hyperdash_proxy',endpoints[1][1],{type:'metaAndAssetCtxs'});}catch(e){m.error=String(e);}
+          write('market_fr_capture.json',m);await ctx.close();await browser.close();
+          write('capture_summary.json',{wallets,coin_count:new Set(coins).size,historical_coin_ranges:jobs.length,finished_at:new Date().toISOString(),screens:screens.map(x=>({wallet:x.wallet,status:x.http_status,at:x.captured_at,error:x.error}))});
+          EOF
+          node collect.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fr-followup-evidence
+          path: fr-followup-evidence/
+          retention-days: 7
+          if-no-files-found: error
